@@ -12,14 +12,18 @@ public class RedisQueueService {
 
     private final RedisTemplate<String, String> redisTemplate;
     private static final String DEPLOYMENT_QUEUE = "autopilot:deployments";
-    public void enqueue(String deploymentId) {
 
+    public void enqueue(String deploymentId) {
         redisTemplate.opsForList().rightPush(DEPLOYMENT_QUEUE, deploymentId);
     }
 
     public String dequeueBlocking() {
-
-        return redisTemplate.opsForList()
-                .leftPop(DEPLOYMENT_QUEUE, Duration.ofSeconds(0));
+        try {
+            return redisTemplate.opsForList()
+                    .leftPop(DEPLOYMENT_QUEUE, Duration.ofSeconds(30));
+        } catch (Exception e) {
+            // Timeout is normal — just return null and let worker loop retry
+            return null;
+        }
     }
 }

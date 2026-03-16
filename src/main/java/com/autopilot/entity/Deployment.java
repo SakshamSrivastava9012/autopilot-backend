@@ -20,18 +20,30 @@ public class Deployment {
 
     private String status;
 
-    @Column(length = 5000)
+    @Column(columnDefinition = "LONGTEXT")
     private String logs;
-
     private Integer port;
 
     private String environment;
 
-    // AWS info
+    // traffic estimate
+    private Integer expectedUsers;
+
+    // AWS configuration
     private String awsRoleArn;
 
     private String awsRegion;
 
-    // NEW FIELD → stores pushed ECR image
+    private String awsAccountId;
+
+    private String ec2KeyPath;
+
+    // Docker / ECR
     private String imageUri;
+
+    // Infrastructure
+    private String publicIp;
+
+    // NEW FIELD
+    private String ec2InstanceId;
 }
