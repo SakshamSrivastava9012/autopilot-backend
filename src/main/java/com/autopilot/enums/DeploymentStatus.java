@@ -1,17 +1,30 @@
 package com.autopilot.enums;
 
-import jakarta.annotation.Resource;
-
 public enum DeploymentStatus {
 
     PENDING,
+
+    CLONING,
+
     ANALYZING,
-    BUILDING,
+
+    BUILDING_IMAGE,
+
     IMAGE_BUILT,
-    PROVISIONING,
+
+    PUSHING_IMAGE,
+
+    IMAGE_PUSHED,
+
+    PROVISIONING_INFRA,
+
+    INFRA_CREATED,
+
     DEPLOYING,
+
     RUNNING,
+
     SUCCESS,
-    FAILED,
-    IMAGE_PUSHED;
+
+    FAILED
 }

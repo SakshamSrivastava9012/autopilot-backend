@@ -27,13 +27,14 @@ public class DeploymentService implements DeploymentServiceInterface {
         deployment.setBranch(request.getBranch());
         deployment.setPort(request.getPort());
         deployment.setEnvironment(request.getEnvironment());
+        deployment.setExpectedUsers(request.getExpectedUsers());
         deployment.setAwsRoleArn(request.getAwsRoleArn());
         deployment.setAwsRegion(request.getAwsRegion());
-        deployment.setStatus(DeploymentStatus.DEPLOYING.name());
+
+        deployment.setStatus(DeploymentStatus.PENDING.name());
 
         deployment = deploymentRepository.save(deployment);
 
-        // Push job to queue
         redisQueueService.enqueue(deployment.getId());
 
         return deployment;
@@ -41,14 +42,12 @@ public class DeploymentService implements DeploymentServiceInterface {
 
     @Override
     public Deployment getDeployment(String id) {
-
         return deploymentRepository.findById(id)
                 .orElseThrow(() -> new RuntimeException("Deployment not found"));
     }
 
     @Override
     public List<Deployment> getAllDeployments() {
-
         return deploymentRepository.findAll();
     }
 }

@@ -19,10 +19,15 @@ public class DockerPushService {
 
     private final AwsCredentialService awsCredentialService;
 
-    public String pushImage(String roleArn, String imageName) throws Exception {
+    public String pushImage(
+            String roleArn,
+            String region,
+            String imageName
+    ) throws Exception {
 
         // 1️⃣ Assume role
-        AwsCredentialsDto creds = awsCredentialService.assumeRole(roleArn);
+        AwsCredentialsDto creds =
+                awsCredentialService.assumeRole(roleArn);
 
         AwsSessionCredentials sessionCredentials =
                 AwsSessionCredentials.create(
@@ -32,67 +37,82 @@ public class DockerPushService {
                 );
 
         EcrClient ecrClient = EcrClient.builder()
-                .region(Region.AP_SOUTH_1)
-                .credentialsProvider(StaticCredentialsProvider.create(sessionCredentials))
+                .region(Region.of(region))
+                .credentialsProvider(
+                        StaticCredentialsProvider.create(sessionCredentials)
+                )
                 .build();
 
-        // 2️⃣ Create repository if not exists
         String repoUri;
 
         try {
-            CreateRepositoryResponse response = ecrClient.createRepository(
-                    CreateRepositoryRequest.builder()
-                            .repositoryName(imageName)
-                            .build()
-            );
+
+            CreateRepositoryResponse response =
+                    ecrClient.createRepository(
+                            CreateRepositoryRequest.builder()
+                                    .repositoryName(imageName)
+                                    .build()
+                    );
 
             repoUri = response.repository().repositoryUri();
 
         } catch (RepositoryAlreadyExistsException e) {
 
-            DescribeRepositoriesResponse response = ecrClient.describeRepositories(
-                    DescribeRepositoriesRequest.builder()
-                            .repositoryNames(imageName)
-                            .build()
-            );
+            DescribeRepositoriesResponse response =
+                    ecrClient.describeRepositories(
+                            DescribeRepositoriesRequest.builder()
+                                    .repositoryNames(imageName)
+                                    .build()
+                    );
 
             repoUri = response.repositories().get(0).repositoryUri();
         }
 
-        // 3️⃣ Get login token
+        // 2️⃣ Get ECR login token
         GetAuthorizationTokenResponse authResponse =
                 ecrClient.getAuthorizationToken();
 
-        AuthorizationData authData = authResponse.authorizationData().get(0);
+        AuthorizationData authData =
+                authResponse.authorizationData().get(0);
 
-        String token = authData.authorizationToken();
+        String token =
+                authData.authorizationToken();
 
-        String decoded = new String(Base64.getDecoder().decode(token));
+        String decoded =
+                new String(Base64.getDecoder().decode(token));
 
-        String password = decoded.split(":")[1];
+        String password =
+                decoded.split(":")[1];
 
-        String registry = authData.proxyEndpoint().replace("https://", "");
+        String registry =
+                authData.proxyEndpoint().replace("https://", "");
 
-        // 4️⃣ Docker login
+        // 3️⃣ Docker login
         runCommand(new String[]{
-                "docker", "login",
-                "-u", "AWS",
-                "-p", password,
+                "docker",
+                "login",
+                "-u",
+                "AWS",
+                "-p",
+                password,
                 registry
         });
 
-        // 5️⃣ Tag image
-        String fullImage = repoUri + ":latest";
+        // 4️⃣ Tag image
+        String fullImage =
+                repoUri + ":latest";
 
         runCommand(new String[]{
-                "docker", "tag",
-                imageName + ":latest",
+                "docker",
+                "tag",
+                imageName,
                 fullImage
         });
 
-        // 6️⃣ Push image
+        // 5️⃣ Push image
         runCommand(new String[]{
-                "docker", "push",
+                "docker",
+                "push",
                 fullImage
         });
 
@@ -101,16 +121,24 @@ public class DockerPushService {
 
     private void runCommand(String[] command) throws Exception {
 
-        Process process = Runtime.getRuntime().exec(command);
+        Process process =
+                Runtime.getRuntime().exec(command);
 
         BufferedReader reader =
-                new BufferedReader(new InputStreamReader(process.getInputStream()));
+                new BufferedReader(
+                        new InputStreamReader(process.getInputStream())
+                );
 
         String line;
+
         while ((line = reader.readLine()) != null) {
             System.out.println(line);
         }
 
-        process.waitFor();
+        int exit = process.waitFor();
+
+        if (exit != 0) {
+            throw new RuntimeException("Docker command failed");
+        }
     }
 }
