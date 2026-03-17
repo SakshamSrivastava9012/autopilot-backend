@@ -1,6 +1,7 @@
 package com.autopilot.service.terraform;
 
 import com.autopilot.dto.AwsCredentialsDto;
+import com.autopilot.dto.TerraformResult;
 import com.autopilot.service.aws.AwsCredentialService;
 import com.autopilot.service.infrastructure.CapacityPlanner;
 import lombok.RequiredArgsConstructor;
@@ -9,6 +10,7 @@ import org.springframework.stereotype.Service;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.nio.file.*;
+import java.util.Map;
 
 @Service
 @RequiredArgsConstructor
@@ -17,10 +19,9 @@ public class TerraformService {
     private final AwsCredentialService awsCredentialService;
     private final CapacityPlanner capacityPlanner;
 
-    private static final String TERRAFORM_ROOT =
-            "/tmp/autopilot-terraform";
+    private static final String TERRAFORM_ROOT = "/tmp/autopilot-terraform";
 
-    public String provisionInfrastructure(
+    public TerraformResult provisionInfrastructure(
             String roleArn,
             String region,
             Integer expectedUsers,
@@ -48,18 +49,14 @@ public class TerraformService {
 
         Files.walk(templateDir).forEach(source -> {
             try {
-
                 Path destination =
                         terraformDir.resolve(
                                 templateDir.relativize(source)
                         );
 
                 if (Files.isDirectory(source)) {
-
                     Files.createDirectories(destination);
-
                 } else {
-
                     Files.copy(
                             source,
                             destination,
@@ -72,8 +69,7 @@ public class TerraformService {
             }
         });
 
-        Path tfvars =
-                terraformDir.resolve("terraform.tfvars");
+        Path tfvars = terraformDir.resolve("terraform.tfvars");
 
         String content =
                 "region=\"" + region + "\"\n" +
@@ -87,53 +83,81 @@ public class TerraformService {
 
         Files.writeString(tfvars, content);
 
-        run(terraformDir,"terraform","init","-upgrade");
-        run(terraformDir,"terraform","apply","-auto-approve");
+        // ✅ NO -upgrade (important)
+        runWithRetry(terraformDir, "terraform", "init");
+        runWithRetry(terraformDir, "terraform", "apply", "-auto-approve");
 
         String instanceId =
-                run(terraformDir,"terraform","output","-raw","instance_id");
+                run(terraformDir, "terraform", "output", "-raw", "instance_id").trim();
 
-        return instanceId.trim();
+        String publicIp =
+                run(terraformDir, "terraform", "output", "-raw", "public_ip").trim();
+
+        TerraformResult result = new TerraformResult();
+        result.setInstanceId(instanceId);
+        result.setPublicIp(publicIp);
+
+        return result;
     }
 
-    private String run(Path dir,String... cmd) throws Exception {
+    // 🔥 Retry wrapper (production reliability)
+    private String runWithRetry(Path dir, String... cmd) throws Exception {
+        int attempts = 3;
 
-        Process p =
-                new ProcessBuilder(cmd)
-                        .directory(dir.toFile())
-                        .redirectErrorStream(true)
-                        .start();
+        for (int i = 1; i <= attempts; i++) {
+            try {
+                return run(dir, cmd);
+            } catch (Exception e) {
+                if (i == attempts) throw e;
+
+                System.out.println("[TERRAFORM] Retry attempt " + i);
+                Thread.sleep(3000);
+            }
+        }
+        throw new RuntimeException("Terraform failed after retries");
+    }
+
+    private String run(Path dir, String... cmd) throws Exception {
+
+        ProcessBuilder pb = new ProcessBuilder(cmd);
+
+        pb.directory(dir.toFile());
+        pb.redirectErrorStream(true);
+
+        // 🔥 CRITICAL: Use Terraform mirror
+        Map<String, String> env = pb.environment();
+        env.put("TF_CLI_CONFIG_FILE", "/home/saksham/.terraformrc");
+
+        Process p = pb.start();
 
         BufferedReader r =
                 new BufferedReader(
                         new InputStreamReader(p.getInputStream())
                 );
 
-        StringBuilder out=new StringBuilder();
+        StringBuilder out = new StringBuilder();
         String line;
 
-        while((line=r.readLine())!=null){
-
-            System.out.println(line);
+        while ((line = r.readLine()) != null) {
+            System.out.println("[TERRAFORM] " + line);
             out.append(line).append("\n");
         }
 
-        int exit=p.waitFor();
+        int exit = p.waitFor();
 
-        if(exit!=0){
-
-            throw new RuntimeException("Terraform failed:\n"+out);
+        if (exit != 0) {
+            throw new RuntimeException("Terraform failed:\n" + out);
         }
 
         return out.toString();
     }
 
-    private void deleteDirectory(Path path)throws Exception{
+    private void deleteDirectory(Path path) throws Exception {
 
-        if(!Files.exists(path))return;
+        if (!Files.exists(path)) return;
 
         Files.walk(path)
-                .sorted((a,b)->b.compareTo(a))
-                .forEach(p->p.toFile().delete());
+                .sorted((a, b) -> b.compareTo(a))
+                .forEach(p -> p.toFile().delete());
     }
 }

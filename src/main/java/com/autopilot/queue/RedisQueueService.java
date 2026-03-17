@@ -22,7 +22,7 @@ public class RedisQueueService {
             return redisTemplate.opsForList()
                     .leftPop(DEPLOYMENT_QUEUE, Duration.ofSeconds(30));
         } catch (Exception e) {
-            // Timeout is normal — just return null and let worker loop retry
+
             return null;
         }
     }

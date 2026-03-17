@@ -3,6 +3,7 @@ package com.autopilot.service.deployment;
 import com.autopilot.analyzer.RepoAnalyzerService;
 import com.autopilot.analyzer.model.RepoAnalysisResult;
 import com.autopilot.analyzer.model.ServiceConfig;
+import com.autopilot.dto.TerraformResult;
 import com.autopilot.entity.Deployment;
 import com.autopilot.enums.DeploymentStatus;
 import com.autopilot.repository.DeploymentRepository;
@@ -39,6 +40,7 @@ public class DeploymentPipelineService {
 
             System.out.println("Starting deployment: " + deployment.getId());
 
+            // 🔹 CLONE
             deployment.setStatus(DeploymentStatus.CLONING.name());
             deploymentRepository.save(deployment);
 
@@ -51,6 +53,7 @@ public class DeploymentPipelineService {
 
             System.out.println("Repository cloned");
 
+            // 🔹 ANALYZE
             deployment.setStatus(DeploymentStatus.ANALYZING.name());
             deploymentRepository.save(deployment);
 
@@ -63,6 +66,7 @@ public class DeploymentPipelineService {
                 throw new RuntimeException("No deployable services detected");
             }
 
+            // 🔹 BUILD + PUSH
             for (ServiceConfig service : services) {
 
                 Path servicePath = workspace.resolve(service.getPath());
@@ -96,14 +100,16 @@ public class DeploymentPipelineService {
                         );
 
                 deployment.setImageUri(imageUri);
+                deploymentRepository.save(deployment); // 🔥 ensure persistence
 
                 System.out.println("Image pushed to ECR: " + imageUri);
             }
 
+            // 🔹 INFRA PROVISION
             deployment.setStatus(DeploymentStatus.PROVISIONING_INFRA.name());
             deploymentRepository.save(deployment);
 
-            String instanceId =
+            TerraformResult result =
                     terraformService.provisionInfrastructure(
                             deployment.getAwsRoleArn(),
                             deployment.getAwsRegion(),
@@ -112,29 +118,42 @@ public class DeploymentPipelineService {
                             deployment.getId()
                     );
 
-            deployment.setEc2InstanceId(instanceId);
+            // ✅ SET BOTH VALUES
+            deployment.setEc2InstanceId(result.getInstanceId());
+            deployment.setPublicIp(result.getPublicIp());
 
-            System.out.println("EC2 instance created: " + instanceId);
+            // 🔥 CRITICAL SAVE (you were missing this earlier)
+            deploymentRepository.save(deployment);
 
-            // Wait for basic boot only — SSMDeployService polls up to 10 minutes
+            System.out.println("EC2 instance created: " + result.getInstanceId());
+            System.out.println("Public IP: " + result.getPublicIp());
+
+            // 🔹 WAIT FOR BOOT
             System.out.println("Waiting for EC2 basic boot...");
-            Thread.sleep(90000); // 90s — wait for apt-get install docker.io to complete;
+            Thread.sleep(90000);
 
+            // 🔹 DEPLOY
             deployment.setStatus(DeploymentStatus.DEPLOYING.name());
             deploymentRepository.save(deployment);
 
             ssmDeployService.deployContainer(
-                    instanceId,
+                    result.getInstanceId(), // ✅ use from result
                     deployment.getImageUri(),
                     deployment.getPort(),
                     deployment.getAwsRegion(),
                     deployment.getAwsRoleArn()
             );
 
+            // 🔹 SUCCESS
             deployment.setStatus(DeploymentStatus.RUNNING.name());
             deploymentRepository.save(deployment);
 
             System.out.println("Deployment completed successfully");
+
+            // 🔥 OPTIONAL: Print access URL
+            System.out.println(
+                    "App URL: http://" + deployment.getPublicIp() + ":" + deployment.getPort()
+            );
 
         } catch (Exception e) {
 
