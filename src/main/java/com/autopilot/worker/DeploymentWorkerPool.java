@@ -22,7 +22,7 @@ public class DeploymentWorkerPool {
     private static final int WORKER_COUNT = 5;
 
     private final ExecutorService executor =
-            Executors.newVirtualThreadPerTaskExecutor();
+            Executors.newCachedThreadPool();
 
     @PostConstruct
     public void startWorkers() {

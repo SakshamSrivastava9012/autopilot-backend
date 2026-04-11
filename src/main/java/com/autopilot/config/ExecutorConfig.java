@@ -11,6 +11,6 @@ public class ExecutorConfig {
 
     @Bean
     public ExecutorService virtualThreadExecutor() {
-        return Executors.newVirtualThreadPerTaskExecutor();
+        return Executors.newFixedThreadPool(10);
     }
 }
