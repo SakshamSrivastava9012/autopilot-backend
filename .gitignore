@@ -35,3 +35,4 @@ build/
 # Secrets
 .env
 .terraform/
+.terraform/
