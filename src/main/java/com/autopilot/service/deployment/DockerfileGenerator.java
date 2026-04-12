@@ -13,16 +13,29 @@ import java.nio.file.Path;
 public class DockerfileGenerator {
 
     private final DockerTemplateLoader templateLoader;
+    private final StellarDockerService stellarDockerService;
 
     public void generate(ServiceConfig service) throws Exception {
 
-        String template = templateLoader.loadTemplate(service.getFramework());
+        String dockerfile;
 
-        template = template.replace(
-                "{{PORT}}",
-                service.getPort().toString()
-        );
+        try {
+            System.out.println("🚀 Using Stellar LLM for Dockerfile generation");
 
+            dockerfile = stellarDockerService.generateDockerfile(service);
+
+            System.out.println("📦 LLM Dockerfile generated successfully");
+
+        } catch (Exception e) {
+
+            System.out.println("⚠️ Stellar failed, fallback to template");
+            System.out.println("Reason: " + e.getMessage());
+
+            dockerfile = templateLoader.loadTemplate(service.getFramework());
+            dockerfile = dockerfile.replace("{{PORT}}", service.getPort().toString());
+        }
+
+        // 🔥 Resolve correct service path
         Path servicePath = Path.of(service.getPath()).toAbsolutePath().normalize();
 
         if (Files.isRegularFile(servicePath)) {
@@ -33,8 +46,13 @@ public class DockerfileGenerator {
 
         Path dockerfilePath = servicePath.resolve("Dockerfile");
 
+        // 🔥 DEBUG: print final Dockerfile
+        System.out.println("📦 FINAL DOCKERFILE:\n" + dockerfile);
+
         try (FileWriter writer = new FileWriter(dockerfilePath.toFile())) {
-            writer.write(template);
+            writer.write(dockerfile);
         }
+
+        System.out.println("✅ Dockerfile written at: " + dockerfilePath);
     }
 }

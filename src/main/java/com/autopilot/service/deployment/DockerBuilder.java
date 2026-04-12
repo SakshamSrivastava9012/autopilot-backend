@@ -21,31 +21,24 @@ public class DockerBuilder {
             path = path.getParent();
         }
 
-        // 🔥 ONLY CHANGE HERE (ADD --no-cache)
         String command = "docker build --no-cache -t " + imageName + " " + path;
 
         System.out.println("🚀 Running: " + command);
 
-        Process process = Runtime.getRuntime().exec(
-                new String[]{"bash", "-c", command}
-        );
+        ProcessBuilder pb = new ProcessBuilder("bash", "-c", command);
+
+        // 🔥 FIX: merge stdout + stderr (prevents deadlock)
+        pb.redirectErrorStream(true);
+
+        Process process = pb.start();
 
         BufferedReader reader = new BufferedReader(
                 new InputStreamReader(process.getInputStream())
         );
 
-        BufferedReader errorReader = new BufferedReader(
-                new InputStreamReader(process.getErrorStream())
-        );
-
         String line;
-
         while ((line = reader.readLine()) != null) {
             System.out.println(line);
-        }
-
-        while ((line = errorReader.readLine()) != null) {
-            System.err.println(line);
         }
 
         int exit = process.waitFor();
