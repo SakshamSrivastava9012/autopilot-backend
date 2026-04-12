@@ -21,7 +21,10 @@ public class DockerBuilder {
             path = path.getParent();
         }
 
-        String command = "docker build -t " + imageName + " " + path;
+        // 🔥 ONLY CHANGE HERE (ADD --no-cache)
+        String command = "docker build --no-cache -t " + imageName + " " + path;
+
+        System.out.println("🚀 Running: " + command);
 
         Process process = Runtime.getRuntime().exec(
                 new String[]{"bash", "-c", command}
@@ -48,8 +51,10 @@ public class DockerBuilder {
         int exit = process.waitFor();
 
         if (exit != 0) {
-            throw new RuntimeException("Docker build failed for image: " + imageName);
+            throw new RuntimeException("❌ Docker build failed for image: " + imageName);
         }
+
+        System.out.println("✅ Docker image built: " + imageName);
 
         return imageName;
     }

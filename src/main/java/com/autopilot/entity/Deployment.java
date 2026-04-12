@@ -15,7 +15,7 @@ public class Deployment {
     private String projectName;
 
     private String repoUrl;
-
+    private String accessUrl;
     private String branch;
 
     private String status;
@@ -46,4 +46,10 @@ public class Deployment {
 
     // NEW FIELD
     private String ec2InstanceId;
+
+    @Column(name = "assigned_port")
+    private Integer assignedPort;
+
+    @Column(name = "base_path")
+    private String basePath;
 }

@@ -87,12 +87,15 @@ public class TerraformService {
         runWithRetry(terraformDir, "terraform", "init");
         runWithRetry(terraformDir, "terraform", "apply", "-auto-approve");
 
-        String instanceId =
-                run(terraformDir, "terraform", "output", "-raw", "instance_id").trim();
+        String instanceIdRaw =
+                run(terraformDir, "terraform", "output", "-raw", "instance_id");
 
-        String publicIp =
-                run(terraformDir, "terraform", "output", "-raw", "public_ip").trim();
+        String publicIpRaw =
+                run(terraformDir, "terraform", "output", "-raw", "public_ip");
 
+// 🔥 CLEAN OUTPUT (remove terraform warnings)
+        String instanceId = extractValue(instanceIdRaw);
+        String publicIp = extractValue(publicIpRaw);
         TerraformResult result = new TerraformResult();
         result.setInstanceId(instanceId);
         result.setPublicIp(publicIp);
@@ -159,5 +162,35 @@ public class TerraformService {
         Files.walk(path)
                 .sorted((a, b) -> b.compareTo(a))
                 .forEach(p -> p.toFile().delete());
+    }
+    private String extractValue(String raw) {
+        if (raw == null) return null;
+
+        String[] lines = raw.split("\n");
+
+        for (String line : lines) {
+            line = line.trim();
+
+            // skip empty & warning lines
+            if (line.isEmpty()) continue;
+            if (line.contains("Warning")) continue;
+            if (line.contains("There are some problems")) continue;
+            if (line.startsWith("?")) continue;
+
+            // valid value line (instance id or ip)
+            if (line.matches("i-[a-zA-Z0-9]+") || line.matches("\\d+\\.\\d+\\.\\d+\\.\\d+")) {
+                return line;
+            }
+        }
+
+        // fallback (last non-empty line)
+        for (int i = lines.length - 1; i >= 0; i--) {
+            String line = lines[i].trim();
+            if (!line.isEmpty()) {
+                return line;
+            }
+        }
+
+        throw new RuntimeException("Failed to extract terraform output from:\n" + raw);
     }
 }

@@ -23,12 +23,13 @@ public class DockerfileGenerator {
                 service.getPort().toString()
         );
 
-        Path servicePath = Path.of(service.getPath());
+        Path servicePath = Path.of(service.getPath()).toAbsolutePath().normalize();
 
-        // If path points to a file (like package.json) use its parent directory
         if (Files.isRegularFile(servicePath)) {
             servicePath = servicePath.getParent();
         }
+
+        Files.createDirectories(servicePath);
 
         Path dockerfilePath = servicePath.resolve("Dockerfile");
 

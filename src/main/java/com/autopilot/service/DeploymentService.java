@@ -35,6 +35,7 @@ public class DeploymentService implements DeploymentServiceInterface {
 
         deployment = deploymentRepository.save(deployment);
 
+        // enqueue async pipeline
         redisQueueService.enqueue(deployment.getId());
 
         return deployment;
@@ -42,6 +43,8 @@ public class DeploymentService implements DeploymentServiceInterface {
 
     @Override
     public Deployment getDeployment(String id) {
+
+        // ✅ SINGLE FETCH (no duplicate query)
         return deploymentRepository.findById(id)
                 .orElseThrow(() -> new RuntimeException("Deployment not found"));
     }

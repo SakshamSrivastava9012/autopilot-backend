@@ -7,7 +7,9 @@ import com.autopilot.dto.TerraformResult;
 import com.autopilot.entity.Deployment;
 import com.autopilot.enums.DeploymentStatus;
 import com.autopilot.repository.DeploymentRepository;
+import com.autopilot.service.PortAllocatorService;
 import com.autopilot.service.aws.DockerPushService;
+import com.autopilot.service.infrastructure.NginxConfigService;
 import com.autopilot.service.infrastructure.ec2.SSMDeployService;
 import com.autopilot.service.terraform.TerraformService;
 
@@ -22,6 +24,7 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class DeploymentPipelineService {
 
+    private final FrontendPatcherService frontendPatcherService;
     private final RepoAnalyzerService repoAnalyzerService;
     private final DockerfileGenerator dockerfileGenerator;
     private final DockerBuilder dockerBuilder;
@@ -29,6 +32,8 @@ public class DeploymentPipelineService {
     private final TerraformService terraformService;
     private final SSMDeployService ssmDeployService;
     private final DeploymentRepository deploymentRepository;
+    private final PortAllocatorService portAllocator;
+    private final NginxConfigService nginxConfigService;
 
     private static final String WORKSPACE_ROOT = "/tmp/autopilot-workspaces";
 
@@ -38,169 +43,201 @@ public class DeploymentPipelineService {
 
         try {
 
-            System.out.println("Starting deployment: " + deployment.getId());
-
-            // 🔹 CLONE
-            deployment.setStatus(DeploymentStatus.CLONING.name());
-            deploymentRepository.save(deployment);
+            // ── CLONE ─────────────────────────────────────────────────────────
+            updateStatus(deployment, DeploymentStatus.CLONING);
 
             Files.createDirectories(Path.of(WORKSPACE_ROOT));
-
             workspace = Path.of(WORKSPACE_ROOT, UUID.randomUUID().toString());
             Files.createDirectories(workspace);
 
             cloneRepo(deployment, workspace);
 
-            System.out.println("Repository cloned");
+            // ── ANALYZE ───────────────────────────────────────────────────────
+            updateStatus(deployment, DeploymentStatus.ANALYZING);
 
-            // 🔹 ANALYZE
-            deployment.setStatus(DeploymentStatus.ANALYZING.name());
-            deploymentRepository.save(deployment);
+            RepoAnalysisResult analysis = repoAnalyzerService.analyzeWorkspace(workspace);
+            ServiceConfig service = analysis.getServices().get(0);
 
-            RepoAnalysisResult analysis =
-                    repoAnalyzerService.analyzeWorkspace(workspace);
+            // service.getPath() is relative — resolve it against workspace to get absolute
+            Path servicePath = workspace.resolve(service.getPath()).toAbsolutePath().normalize();
 
-            List<ServiceConfig> services = analysis.getServices();
-
-            if (services == null || services.isEmpty()) {
-                throw new RuntimeException("No deployable services detected");
+// 🔥 FIX: if analyzer returned a FILE, use its parent directory
+            if (Files.isRegularFile(servicePath)) {
+                servicePath = servicePath.getParent();
             }
 
-            // 🔹 BUILD + PUSH
-            for (ServiceConfig service : services) {
+            service.setPath(servicePath.toString());
 
-                Path servicePath = workspace.resolve(service.getPath());
+            int containerPort = service.getPort() != null ? service.getPort() : 3000;
+            deployment.setPort(containerPort);
 
-                if (Files.isRegularFile(servicePath)) {
-                    servicePath = servicePath.getParent();
-                }
-
-                service.setPath(servicePath.toString());
-
-                if (!service.isDockerfileExists()) {
-                    dockerfileGenerator.generate(service);
-                }
-
-                deployment.setStatus(DeploymentStatus.BUILDING_IMAGE.name());
-                deploymentRepository.save(deployment);
-
-                String imageName =
-                        dockerBuilder.build(service, deployment.getId());
-
-                System.out.println("Docker image built: " + imageName);
-
-                deployment.setStatus(DeploymentStatus.PUSHING_IMAGE.name());
-                deploymentRepository.save(deployment);
-
-                String imageUri =
-                        dockerPushService.pushImage(
-                                deployment.getAwsRoleArn(),
-                                deployment.getAwsRegion(),
-                                imageName
-                        );
-
-                deployment.setImageUri(imageUri);
-                deploymentRepository.save(deployment); // 🔥 ensure persistence
-
-                System.out.println("Image pushed to ECR: " + imageUri);
-            }
-
-            // 🔹 INFRA PROVISION
-            deployment.setStatus(DeploymentStatus.PROVISIONING_INFRA.name());
+            // FIX 1: 8 chars (dashes stripped) not 5 — prevents nginx block collisions.
+            // UUID substring(0,5) gives ~1M combinations and shares prefixes.
+            // replace("-","").substring(0,8) gives ~4B combinations.
+            String basePath = "/app-" + deployment.getId().replace("-", "").substring(0, 8);
+            deployment.setBasePath(basePath);
             deploymentRepository.save(deployment);
 
-            TerraformResult result =
-                    terraformService.provisionInfrastructure(
-                            deployment.getAwsRoleArn(),
-                            deployment.getAwsRegion(),
-                            deployment.getExpectedUsers(),
-                            deployment.getPort(),
-                            deployment.getId()
-                    );
+            // FIX 2: Patch servicePath, NOT workspace root.
+            // service.getPath() points to the actual Next.js/React project directory
+            // (may be a subdirectory of the repo, e.g. frontend/ in a monorepo).
+            // Patching workspace root writes next.config.js in the wrong place —
+            // Docker's COPY . . copies it but npm run build runs in servicePath.
+            frontendPatcherService.patchFrontend(servicePath, basePath);
 
-            // ✅ SET BOTH VALUES
+            // FIX 3: Delete .next from servicePath, not workspace root.
+            // Same mismatch — stale build lives next to the app's package.json.
+            Path nextDir = servicePath.resolve(".next");
+            if (Files.exists(nextDir)) {
+                System.out.println("Deleting stale .next build at: " + nextDir);
+                Files.walk(nextDir)
+                        .sorted((a, b) -> b.compareTo(a))
+                        .forEach(p -> { try { Files.delete(p); } catch (Exception ignored) {} });
+            }
+
+            // ── BUILD IMAGE ───────────────────────────────────────────────────
+            if (!service.isDockerfileExists()) {
+                dockerfileGenerator.generate(service);
+            }
+
+            updateStatus(deployment, DeploymentStatus.BUILDING_IMAGE);
+            String imageName = dockerBuilder.build(service, deployment.getId());
+
+            // ── PUSH IMAGE ────────────────────────────────────────────────────
+            updateStatus(deployment, DeploymentStatus.PUSHING_IMAGE);
+
+            String imageUri = dockerPushService.pushImage(
+                    deployment.getAwsRoleArn(),
+                    deployment.getAwsRegion(),
+                    imageName
+            );
+
+            deployment.setImageUri(imageUri);
+            deploymentRepository.save(deployment);
+
+            // ── PROVISION INFRA ───────────────────────────────────────────────
+            updateStatus(deployment, DeploymentStatus.PROVISIONING_INFRA);
+
+            TerraformResult result = terraformService.provisionInfrastructure(
+                    deployment.getAwsRoleArn(),
+                    deployment.getAwsRegion(),
+                    deployment.getExpectedUsers(),
+                    80,
+                    deployment.getId()
+            );
+
             deployment.setEc2InstanceId(result.getInstanceId());
             deployment.setPublicIp(result.getPublicIp());
-
-            // 🔥 CRITICAL SAVE (you were missing this earlier)
             deploymentRepository.save(deployment);
 
-            System.out.println("EC2 instance created: " + result.getInstanceId());
-            System.out.println("Public IP: " + result.getPublicIp());
+            // Set accessUrl immediately so UI shows it during the cloud-init wait
+            int assignedPort = portAllocator.allocatePort();
+            deployment.setAssignedPort(assignedPort);
 
-            // 🔹 WAIT FOR BOOT
-            System.out.println("Waiting for EC2 basic boot...");
-            Thread.sleep(90000);
-
-            // 🔹 DEPLOY
-            deployment.setStatus(DeploymentStatus.DEPLOYING.name());
+            String accessUrl = "http://" + result.getPublicIp() + basePath + "/";
+            deployment.setAccessUrl(accessUrl);
             deploymentRepository.save(deployment);
+
+            System.out.println("Access URL: " + accessUrl);
+
+            // Wait for cloud-init to finish installing docker/nginx/SSM on fresh EC2.
+            // waitForSSM inside deployContainer handles SSM readiness, but SSM agent
+            // can't even register until cloud-init finishes the apt installs first.
+            System.out.println("Waiting 60s for EC2 cloud-init...");
+            Thread.sleep(60_000);
+
+            // ── DEPLOY CONTAINER ──────────────────────────────────────────────
+            // deployContainer handles everything: wait for SSM, start docker,
+            // ECR login, pull, run, AND health-check the container port.
+            updateStatus(deployment, DeploymentStatus.DEPLOYING);
 
             ssmDeployService.deployContainer(
-                    result.getInstanceId(), // ✅ use from result
+                    result.getInstanceId(),
                     deployment.getImageUri(),
-                    deployment.getPort(),
+                    assignedPort,
+                    containerPort,
+                    deployment.getAwsRegion(),
+                    deployment.getAwsRoleArn(),
+                    deployment.getId()
+            );
+
+            // FIX 4: verifyContainerViaSSM removed — it was redundant (deployContainer
+            // already health-checks) and used curl -sf which fails on Next.js 404
+            // responses when basePath is set. Both issues are fixed in deployContainer.
+
+            // ── MARK RUNNING ──────────────────────────────────────────────────
+            // Set RUNNING before the nginx query so this deployment is included
+            // in findByStatusAndEc2InstanceId (fixes the missing-self bug).
+            updateStatus(deployment, DeploymentStatus.RUNNING);
+
+            // ── UPDATE NGINX ──────────────────────────────────────────────────
+            List<Deployment> allRunning = deploymentRepository.findByStatusAndEc2InstanceId(
+                    DeploymentStatus.RUNNING.name(),
+                    result.getInstanceId()
+            );
+
+            // Defensive: add self if DB hasn't fully committed the status update yet
+            if (allRunning.stream().noneMatch(d -> d.getId().equals(deployment.getId()))) {
+                allRunning.add(deployment);
+            }
+
+            String nginxConfig = nginxConfigService.generateConfig(allRunning);
+
+            ssmDeployService.updateNginx(
+                    result.getInstanceId(),
+                    nginxConfig,
                     deployment.getAwsRegion(),
                     deployment.getAwsRoleArn()
             );
 
-            // 🔹 SUCCESS
-            deployment.setStatus(DeploymentStatus.RUNNING.name());
-            deploymentRepository.save(deployment);
-
-            System.out.println("Deployment completed successfully");
-
-            // 🔥 OPTIONAL: Print access URL
-            System.out.println(
-                    "App URL: http://" + deployment.getPublicIp() + ":" + deployment.getPort()
-            );
+            System.out.println("Deployment SUCCESS -> " + accessUrl);
 
         } catch (Exception e) {
 
+            deployment.setStatus(DeploymentStatus.FAILED.name());
+            // NPE and similar exceptions have null getMessage() — guard against that
+            deployment.setLogs(e.getMessage() != null ? e.getMessage() : e.getClass().getName());
+            deploymentRepository.save(deployment);
             e.printStackTrace();
 
-            deployment.setStatus(DeploymentStatus.FAILED.name());
-            deployment.setLogs(e.getMessage());
-            deploymentRepository.save(deployment);
-
         } finally {
-
             cleanup(workspace);
         }
     }
 
+    // ── HELPERS ───────────────────────────────────────────────────────────────
+
+    private void updateStatus(Deployment deployment, DeploymentStatus status) {
+        deployment.setStatus(status.name());
+        deploymentRepository.save(deployment);
+    }
+
     private void cloneRepo(Deployment deployment, Path workspace) throws Exception {
+        String command = "git clone --depth=1 -b "
+                + shellEscape(deployment.getBranch())
+                + " "
+                + shellEscape(deployment.getRepoUrl())
+                + " "
+                + workspace;
 
-        String command =
-                "git clone --depth=1 -b "
-                        + deployment.getBranch()
-                        + " "
-                        + deployment.getRepoUrl()
-                        + " "
-                        + workspace;
+        Process process = Runtime.getRuntime().exec(new String[]{"bash", "-c", command});
 
-        Process process =
-                Runtime.getRuntime().exec(
-                        new String[]{"bash", "-c", command}
-                );
-
-        int exit = process.waitFor();
-
-        if (exit != 0) {
-            throw new RuntimeException("Git clone failed");
+        if (process.waitFor() != 0) {
+            String stderr = new String(process.getErrorStream().readAllBytes());
+            throw new RuntimeException("Git clone failed: " + stderr);
         }
     }
 
+    private String shellEscape(String value) {
+        return "'" + value.replace("'", "'\\''") + "'";
+    }
+
     private void cleanup(Path workspace) {
-
         try {
-
             if (workspace == null) return;
-
             Files.walk(workspace)
                     .sorted((a, b) -> b.compareTo(a))
-                    .forEach(path -> path.toFile().delete());
-
+                    .forEach(p -> p.toFile().delete());
         } catch (Exception ignored) {}
     }
 }

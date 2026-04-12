@@ -1,22 +1,21 @@
-FROM node:20-alpine AS builder
+FROM node:20-alpine
 
 WORKDIR /app
 
 COPY package*.json ./
 
+# install deps
 RUN npm install
 
 COPY . .
 
-RUN npm run build
+# 🔥 ALWAYS CLEAN OLD BUILD
+RUN rm -rf .next
 
-
-FROM node:20-alpine
-
-WORKDIR /app
-
-COPY --from=builder /app ./
+# 🔥 BUILD WITHOUT ESLINT (CRITICAL)
+RUN npx next build --no-lint
 
 EXPOSE {{PORT}}
 
-CMD ["npm","start"]
+# 🔥 ENSURE SERVER BINDS PROPERLY
+CMD ["npm","start","--","-H","0.0.0.0"]
