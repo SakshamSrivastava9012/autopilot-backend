@@ -9,14 +9,15 @@ resource "aws_security_group" "autopilot_sg" {
   name        = "autopilot-${var.deployment_id}"
   description = "Autopilot deployment SG"
 
+  # 🔥 ONLY NGINX PUBLIC
   ingress {
-    from_port   = var.app_port
-    to_port     = var.app_port
+    from_port   = 80
+    to_port     = 80
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # 🔥 OPTIONAL (for SSH debug - recommended for now)
+  # 🔧 Optional SSH (remove later in prod)
   ingress {
     from_port   = 22
     to_port     = 22
@@ -86,16 +87,42 @@ set +e
 echo "=== Starting bootstrap ==="
 
 apt-get update -y
-apt-get install -y docker.io awscli snapd curl
+apt-get install -y docker.io awscli snapd curl nginx
+
+# Docker setup
+# Docker setup (FINAL STABLE)
+apt-get update -y
+apt-get install -y docker.io
+
+systemctl daemon-reexec
+systemctl daemon-reload
 
 systemctl enable docker
-systemctl start docker
+
+for i in $(seq 1 10); do
+  systemctl start docker
+  sleep 3
+  systemctl is-active --quiet docker && break
+done
+
+systemctl is-active docker || exit 1
+
+# wait for docker daemon ready
+for i in $(seq 1 15); do
+  docker info && break
+  sleep 2
+done
+
 usermod -aG docker ubuntu
 
+# NGINX setup
+systemctl enable nginx
+systemctl start nginx
+
+# Snap + SSM
 systemctl enable snapd
 systemctl start snapd
 
-# Wait for snap
 for i in $(seq 1 10); do
   if [ -S /run/snapd.socket ]; then
     break
@@ -103,8 +130,8 @@ for i in $(seq 1 10); do
   sleep 3
 done
 
-snap install amazon-ssm-agent --classic
-
+systemctl enable amazon-ssm-agent || true
+systemctl start amazon-ssm-agent || true
 systemctl enable snap.amazon-ssm-agent.amazon-ssm-agent
 systemctl start snap.amazon-ssm-agent.amazon-ssm-agent
 
@@ -126,6 +153,4 @@ EOF
     Name = "autopilot-${var.deployment_id}"
   }
 }
-
-# 🔥🔥🔥 CRITICAL FIX (YOU WERE MISSING THIS)
 
