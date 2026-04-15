@@ -36,9 +36,7 @@ public class SecurityConfig {
                 .requestMatchers(
                     "/api/auth/**",
                     "/oauth2/**",
-                    "/login/oauth2/**",
-                            "/deploy/**"
-
+                    "/login/oauth2/**"
                 ).permitAll()
                 // Everything else requires a valid JWT
                 .anyRequest().authenticated()

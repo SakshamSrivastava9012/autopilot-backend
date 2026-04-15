@@ -11,4 +11,14 @@ public interface DeploymentRepository extends JpaRepository<Deployment, String> 
     Integer findMaxAssignedPort();
     List<Deployment> findByStatus(String status);
     List<Deployment> findByStatusAndEc2InstanceId(String status, String ec2InstanceId);
+
+    /**
+     * Fetch all deployments belonging to a specific user.
+     */
+    List<Deployment> findByUserId(String userId);
+
+    /**
+     * Fetch a single deployment only if it belongs to the given user (ownership check).
+     */
+    java.util.Optional<Deployment> findByIdAndUserId(String id, String userId);
 }

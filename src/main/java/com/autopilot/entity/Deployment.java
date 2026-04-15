@@ -1,5 +1,6 @@
 package com.autopilot.entity;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.*;
 import lombok.Data;
 
@@ -11,6 +12,20 @@ public class Deployment {
     @Id
     @GeneratedValue(strategy = GenerationType.UUID)
     private String id;
+
+    /**
+     * The user who owns this deployment.
+     */
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "user_id")
+    @JsonIgnore
+    private User user;
+
+    /**
+     * Denormalized userId for quick queries without joining.
+     */
+    @Column(name = "user_id", insertable = false, updatable = false)
+    private String userId;
 
     private String projectName;
 

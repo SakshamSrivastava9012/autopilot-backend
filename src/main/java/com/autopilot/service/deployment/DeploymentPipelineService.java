@@ -11,6 +11,7 @@ import com.autopilot.service.PortAllocatorService;
 import com.autopilot.service.aws.DockerPushService;
 import com.autopilot.service.infrastructure.NginxConfigService;
 import com.autopilot.service.infrastructure.ec2.SSMDeployService;
+import com.autopilot.service.log.DeploymentLogService;
 import com.autopilot.service.terraform.TerraformService;
 
 import lombok.RequiredArgsConstructor;
@@ -34,26 +35,31 @@ public class DeploymentPipelineService {
     private final DeploymentRepository deploymentRepository;
     private final PortAllocatorService portAllocator;
     private final NginxConfigService nginxConfigService;
+    private final DeploymentLogService logService;
 
     private static final String WORKSPACE_ROOT = "/tmp/autopilot-workspaces";
 
     public void execute(Deployment deployment) {
 
         Path workspace = null;
+        String did = deployment.getId();
 
         try {
 
             // ── CLONE ─────────────────────────────────────────────────────────
             updateStatus(deployment, DeploymentStatus.CLONING);
+            logService.info(did, "CLONING", "Starting git clone for " + deployment.getRepoUrl() + " [branch: " + deployment.getBranch() + "]");
 
             Files.createDirectories(Path.of(WORKSPACE_ROOT));
             workspace = Path.of(WORKSPACE_ROOT, UUID.randomUUID().toString());
             Files.createDirectories(workspace);
 
             cloneRepo(deployment, workspace);
+            logService.info(did, "CLONING", "Repository cloned successfully to workspace");
 
             // ── ANALYZE ───────────────────────────────────────────────────────
             updateStatus(deployment, DeploymentStatus.ANALYZING);
+            logService.info(did, "ANALYZING", "Analyzing repository structure...");
 
             RepoAnalysisResult analysis = repoAnalyzerService.analyzeWorkspace(workspace);
             ServiceConfig service = analysis.getServices().get(0);
@@ -61,7 +67,7 @@ public class DeploymentPipelineService {
             // service.getPath() is relative — resolve it against workspace to get absolute
             Path servicePath = workspace.resolve(service.getPath()).toAbsolutePath().normalize();
 
-// 🔥 FIX: if analyzer returned a FILE, use its parent directory
+            // 🔥 FIX: if analyzer returned a FILE, use its parent directory
             if (Files.isRegularFile(servicePath)) {
                 servicePath = servicePath.getParent();
             }
@@ -78,18 +84,21 @@ public class DeploymentPipelineService {
             deployment.setBasePath(basePath);
             deploymentRepository.save(deployment);
 
+            logService.info(did, "ANALYZING", "Detected service: " + service.getFramework() + " | port: " + containerPort + " | basePath: " + basePath);
+
             // FIX 2: Patch servicePath, NOT workspace root.
             // service.getPath() points to the actual Next.js/React project directory
             // (may be a subdirectory of the repo, e.g. frontend/ in a monorepo).
             // Patching workspace root writes next.config.js in the wrong place —
             // Docker's COPY . . copies it but npm run build runs in servicePath.
             frontendPatcherService.patchFrontend(servicePath, basePath);
+            logService.info(did, "ANALYZING", "Frontend patched with basePath: " + basePath);
 
             // FIX 3: Delete .next from servicePath, not workspace root.
             // Same mismatch — stale build lives next to the app's package.json.
             Path nextDir = servicePath.resolve(".next");
             if (Files.exists(nextDir)) {
-                System.out.println("Deleting stale .next build at: " + nextDir);
+                logService.info(did, "ANALYZING", "Deleting stale .next build cache");
                 Files.walk(nextDir)
                         .sorted((a, b) -> b.compareTo(a))
                         .forEach(p -> { try { Files.delete(p); } catch (Exception ignored) {} });
@@ -97,14 +106,20 @@ public class DeploymentPipelineService {
 
             // ── BUILD IMAGE ───────────────────────────────────────────────────
             if (!service.isDockerfileExists()) {
+                logService.info(did, "BUILDING_IMAGE", "Generating Dockerfile (none found in repo)");
                 dockerfileGenerator.generate(service);
+            } else {
+                logService.info(did, "BUILDING_IMAGE", "Using existing Dockerfile from repository");
             }
 
             updateStatus(deployment, DeploymentStatus.BUILDING_IMAGE);
+            logService.info(did, "BUILDING_IMAGE", "Building Docker image...");
             String imageName = dockerBuilder.build(service, deployment.getId());
+            logService.info(did, "BUILDING_IMAGE", "Docker image built successfully: " + imageName);
 
             // ── PUSH IMAGE ────────────────────────────────────────────────────
             updateStatus(deployment, DeploymentStatus.PUSHING_IMAGE);
+            logService.info(did, "PUSHING_IMAGE", "Pushing image to ECR (" + deployment.getAwsRegion() + ")...");
 
             String imageUri = dockerPushService.pushImage(
                     deployment.getAwsRoleArn(),
@@ -114,9 +129,12 @@ public class DeploymentPipelineService {
 
             deployment.setImageUri(imageUri);
             deploymentRepository.save(deployment);
+            logService.info(did, "PUSHING_IMAGE", "Image pushed successfully: " + imageUri);
 
             // ── PROVISION INFRA ───────────────────────────────────────────────
             updateStatus(deployment, DeploymentStatus.PROVISIONING_INFRA);
+            logService.info(did, "PROVISIONING_INFRA", "Provisioning AWS infrastructure via Terraform...");
+            logService.info(did, "PROVISIONING_INFRA", "Expected users: " + deployment.getExpectedUsers() + " | Region: " + deployment.getAwsRegion());
 
             TerraformResult result = terraformService.provisionInfrastructure(
                     deployment.getAwsRoleArn(),
@@ -130,6 +148,8 @@ public class DeploymentPipelineService {
             deployment.setPublicIp(result.getPublicIp());
             deploymentRepository.save(deployment);
 
+            logService.info(did, "PROVISIONING_INFRA", "Infrastructure provisioned — EC2: " + result.getInstanceId() + " | IP: " + result.getPublicIp());
+
             // Set accessUrl immediately so UI shows it during the cloud-init wait
             int assignedPort = portAllocator.allocatePort();
             deployment.setAssignedPort(assignedPort);
@@ -138,18 +158,20 @@ public class DeploymentPipelineService {
             deployment.setAccessUrl(accessUrl);
             deploymentRepository.save(deployment);
 
-            System.out.println("Access URL: " + accessUrl);
+            logService.info(did, "PROVISIONING_INFRA", "Access URL: " + accessUrl);
 
             // Wait for cloud-init to finish installing docker/nginx/SSM on fresh EC2.
             // waitForSSM inside deployContainer handles SSM readiness, but SSM agent
             // can't even register until cloud-init finishes the apt installs first.
-            System.out.println("Waiting 60s for EC2 cloud-init...");
+            logService.info(did, "PROVISIONING_INFRA", "Waiting 60s for EC2 cloud-init to complete...");
             Thread.sleep(60_000);
+            logService.info(did, "PROVISIONING_INFRA", "Cloud-init wait complete");
 
             // ── DEPLOY CONTAINER ──────────────────────────────────────────────
             // deployContainer handles everything: wait for SSM, start docker,
             // ECR login, pull, run, AND health-check the container port.
             updateStatus(deployment, DeploymentStatus.DEPLOYING);
+            logService.info(did, "DEPLOYING", "Deploying container to EC2 via SSM...");
 
             ssmDeployService.deployContainer(
                     result.getInstanceId(),
@@ -161,6 +183,8 @@ public class DeploymentPipelineService {
                     deployment.getId()
             );
 
+            logService.info(did, "DEPLOYING", "Container deployed and health check passed");
+
             // FIX 4: verifyContainerViaSSM removed — it was redundant (deployContainer
             // already health-checks) and used curl -sf which fails on Next.js 404
             // responses when basePath is set. Both issues are fixed in deployContainer.
@@ -169,8 +193,11 @@ public class DeploymentPipelineService {
             // Set RUNNING before the nginx query so this deployment is included
             // in findByStatusAndEc2InstanceId (fixes the missing-self bug).
             updateStatus(deployment, DeploymentStatus.RUNNING);
+            logService.info(did, "RUNNING", "Deployment marked as RUNNING");
 
             // ── UPDATE NGINX ──────────────────────────────────────────────────
+            logService.info(did, "RUNNING", "Updating Nginx reverse proxy configuration...");
+
             List<Deployment> allRunning = deploymentRepository.findByStatusAndEc2InstanceId(
                     DeploymentStatus.RUNNING.name(),
                     result.getInstanceId()
@@ -190,14 +217,23 @@ public class DeploymentPipelineService {
                     deployment.getAwsRoleArn()
             );
 
-            System.out.println("Deployment SUCCESS -> " + accessUrl);
+            logService.info(did, "RUNNING", "Nginx configuration updated successfully");
+            logService.info(did, "SUCCESS", "🎉 Deployment SUCCESS → " + accessUrl);
+
+            // Signal SSE clients that the pipeline is done
+            logService.complete(did);
 
         } catch (Exception e) {
 
             deployment.setStatus(DeploymentStatus.FAILED.name());
             // NPE and similar exceptions have null getMessage() — guard against that
-            deployment.setLogs(e.getMessage() != null ? e.getMessage() : e.getClass().getName());
+            String errorMsg = e.getMessage() != null ? e.getMessage() : e.getClass().getName();
+            deployment.setLogs(errorMsg);
             deploymentRepository.save(deployment);
+
+            logService.error(did, "FAILED", "❌ Deployment failed: " + errorMsg);
+            logService.complete(did);
+
             e.printStackTrace();
 
         } finally {

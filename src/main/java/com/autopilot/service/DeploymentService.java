@@ -2,11 +2,14 @@ package com.autopilot.service;
 
 import com.autopilot.dto.DeployRequest;
 import com.autopilot.entity.Deployment;
+import com.autopilot.entity.User;
 import com.autopilot.enums.DeploymentStatus;
 import com.autopilot.queue.RedisQueueService;
 import com.autopilot.repository.DeploymentRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.util.List;
 
@@ -18,10 +21,11 @@ public class DeploymentService implements DeploymentServiceInterface {
     private final RedisQueueService redisQueueService;
 
     @Override
-    public Deployment createDeployment(DeployRequest request) {
+    public Deployment createDeployment(DeployRequest request, User user) {
 
         Deployment deployment = new Deployment();
 
+        deployment.setUser(user);  // ← ownership link
         deployment.setProjectName(request.getProjectName());
         deployment.setRepoUrl(request.getRepoUrl());
         deployment.setBranch(request.getBranch());
@@ -42,15 +46,16 @@ public class DeploymentService implements DeploymentServiceInterface {
     }
 
     @Override
-    public Deployment getDeployment(String id) {
+    public Deployment getDeployment(String id, User user) {
 
-        // ✅ SINGLE FETCH (no duplicate query)
-        return deploymentRepository.findById(id)
-                .orElseThrow(() -> new RuntimeException("Deployment not found"));
+        // ✅ Ownership check — user can only fetch their own deployments
+        return deploymentRepository.findByIdAndUserId(id, user.getId())
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.NOT_FOUND, "Deployment not found"));
     }
 
     @Override
-    public List<Deployment> getAllDeployments() {
-        return deploymentRepository.findAll();
+    public List<Deployment> getUserDeployments(User user) {
+        return deploymentRepository.findByUserId(user.getId());
     }
 }
