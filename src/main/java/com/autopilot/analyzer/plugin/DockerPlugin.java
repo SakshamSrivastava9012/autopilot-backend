@@ -17,6 +17,7 @@ public class DockerPlugin implements FrameworkPlugin {
                 ServiceConfig service = new ServiceConfig();
 
                 service.setFramework("docker");
+                service.setStrategyUsed("DOCKERFILE");
                 service.setName("docker-service");
                 service.setPath(file.replace("/Dockerfile",""));
                 service.setDockerfileExists(true);

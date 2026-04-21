@@ -14,6 +14,7 @@ import software.amazon.awssdk.services.ssm.model.*;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 
 @Service
 @RequiredArgsConstructor
@@ -30,8 +31,11 @@ public class SSMDeployService {
     private static final int POLL_ITERATIONS = 150;
     private static final int POLL_INTERVAL_MS = 4000;
 
+    /** No-op logger for backward compat */
+    private static final Consumer<String> NOOP_LOG = msg -> {};
+
     // =========================
-    // DEPLOY CONTAINER
+    // DEPLOY CONTAINER (legacy overload)
     // =========================
     public void deployContainer(
             String instanceId,
@@ -42,72 +46,126 @@ public class SSMDeployService {
             String roleArn,
             String deploymentId
     ) throws Exception {
+        deployContainer(instanceId, image, hostPort, containerPort, region, roleArn, deploymentId, List.of(), List.of(), NOOP_LOG);
+    }
+
+    // =========================
+    // DEPLOY CONTAINER (env vars, no progress log)
+    // =========================
+    public void deployContainer(
+            String instanceId,
+            String image,
+            int hostPort,
+            int containerPort,
+            String region,
+            String roleArn,
+            String deploymentId,
+            List<String> envFlags,
+            List<String> preDeployCommands
+    ) throws Exception {
+        deployContainer(instanceId, image, hostPort, containerPort, region, roleArn, deploymentId, envFlags, preDeployCommands, NOOP_LOG);
+    }
+
+    /**
+     * Deploy container WITH environment variable injection, pre-deploy commands, and progress logging.
+     *
+     * @param envFlags          List of "-e KEY='value'" flags for docker run
+     * @param preDeployCommands Commands to run before the app container (e.g., Redis provisioning)
+     * @param progressLog       Callback for real-time log messages (sent to frontend)
+     */
+    public void deployContainer(
+            String instanceId,
+            String image,
+            int hostPort,
+            int containerPort,
+            String region,
+            String roleArn,
+            String deploymentId,
+            List<String> envFlags,
+            List<String> preDeployCommands,
+            Consumer<String> progressLog
+    ) throws Exception {
 
         SsmClient ssmClient = buildSsmClient(roleArn, region);
-        waitForSSM(ssmClient, instanceId);
+
+        progressLog.accept("📡 Waiting for SSM agent to come online on " + instanceId + "...");
+        waitForSSM(ssmClient, instanceId, progressLog);
+        progressLog.accept("✅ SSM agent online — sending deploy commands...");
 
         String registry      = image.substring(0, image.indexOf('/'));
         String containerName = "autopilot-" + deploymentId;
 
-        List<String> commands = List.of(
+        // Build the docker run command with env vars
+        StringBuilder dockerRunCmd = new StringBuilder();
+        dockerRunCmd.append(" docker run -d");
+        dockerRunCmd.append(" --name ").append(containerName);
+        dockerRunCmd.append(" --network autopilot");
+        dockerRunCmd.append(" --restart unless-stopped");
+        dockerRunCmd.append(" -p 127.0.0.1:").append(hostPort).append(":").append(containerPort);
 
-                // Reload systemd in case cloud-init left it in a dirty state
-                "systemctl daemon-reload 2>/dev/null || true",
+        // Inject environment variables
+        for (String flag : envFlags) {
+            // Each flag looks like: -e KEY='value'
+            dockerRunCmd.append(" ").append(flag);
+        }
 
-                // Enable + start docker — ignore exit code, daemon may already be starting
-                "systemctl enable docker 2>/dev/null || true",
-                "systemctl start docker 2>/dev/null || true",
+        dockerRunCmd.append(" ").append(image);
+        dockerRunCmd.append(" || { echo 'docker run failed. Container logs:'; docker logs ")
+                .append(containerName).append(" 2>&1 || true; exit 1; }");
 
-                // FIX 2 (partial): wait for dockerd socket, not just systemctl exit code.
-                // systemctl start returns 0 when systemd ACCEPTS the request, not when
-                // dockerd is actually listening. Poll docker info instead.
-                "for i in $(seq 1 30); do" +
-                        " if docker info >/dev/null 2>&1; then echo \"Docker ready (attempt $i)\"; break; fi;" +
-                        " if [ $i -eq 30 ]; then" +
-                        "   echo 'ERROR: dockerd never became ready';" +
-                        "   journalctl -u docker --no-pager -n 50;" +
-                        "   exit 1;" +
-                        " fi;" +
-                        " sleep 2;" +
-                        " done",
+        // Build the full command list
+        List<String> commands = new java.util.ArrayList<>();
 
-                // ECR login
-                "aws ecr get-login-password --region " + region +
-                        " | docker login --username AWS --password-stdin " + registry +
-                        " || { echo 'ECR login failed'; exit 1; }",
+        // System setup
+        commands.add("systemctl daemon-reload 2>/dev/null || true");
+        commands.add("systemctl enable docker 2>/dev/null || true");
+        commands.add("systemctl start docker 2>/dev/null || true");
 
-                // Pull image
-                "docker pull " + image +
-                        " || { echo 'docker pull failed for image: " + image + "'; exit 1; }",
+        // Wait for Docker daemon
+        commands.add("for i in $(seq 1 30); do" +
+                " if docker info >/dev/null 2>&1; then echo \"Docker ready (attempt $i)\"; break; fi;" +
+                " if [ $i -eq 30 ]; then" +
+                "   echo 'ERROR: dockerd never became ready';" +
+                "   journalctl -u docker --no-pager -n 50;" +
+                "   exit 1;" +
+                " fi;" +
+                " sleep 2;" +
+                " done");
 
-                // Remove old container (never fail)
-                "docker rm -f " + containerName + " 2>/dev/null || true",
+        // ECR login
+        commands.add("aws ecr get-login-password --region " + region +
+                " | docker login --username AWS --password-stdin " + registry +
+                " || { echo 'ECR login failed'; exit 1; }");
 
-                // Prune dangling images to prevent disk-full on repeated deploys
-                "docker image prune -f 2>/dev/null || true",
+        // Pull image
+        commands.add("docker pull " + image +
+                " || { echo 'docker pull failed for image: " + image + "'; exit 1; }");
 
-                // Run container — bind to loopback only, nginx is the sole entry point
-                "docker run -d" +
-                        " --name " + containerName +
-                        " --restart unless-stopped" +
-                        " -p 127.0.0.1:" + hostPort + ":" + containerPort +
-                        " " + image +
-                        " || { echo 'docker run failed. Container logs:'; docker logs " + containerName + " 2>&1 || true; exit 1; }",
+        // Remove old container
+        commands.add("docker rm -f " + containerName + " 2>/dev/null || true");
+        commands.add("docker image prune -f 2>/dev/null || true");
+        
+        // Create dedicated network for Autopilot containers
+        commands.add("docker network create autopilot 2>/dev/null || true");
 
-                // FIX 2: Health check — use curl -o /dev/null (don't fail on HTTP status).
-                // Next.js returns 404 on root '/' when basePath is set, but the server IS
-                // running. We only care that the port is accepting TCP connections, not
-                // that it returns 200. --fail (-f) removed intentionally.
-                "for i in $(seq 1 20); do" +
-                        " if curl -s --max-time 3 -o /dev/null http://127.0.0.1:" + hostPort + "; then" +
-                        "   echo \"Container accepting connections (attempt $i)\"; exit 0;" +
-                        " fi;" +
-                        " sleep 3;" +
-                        " done;" +
-                        " echo 'Container never accepted connections. Last 100 log lines:';" +
-                        " docker logs --tail 100 " + containerName + " 2>&1;" +
-                        " exit 1"
-        );
+        // Run pre-deploy commands (e.g., Redis provisioning)
+        commands.addAll(preDeployCommands);
+
+        // Run the main app container with env vars injected
+        commands.add(dockerRunCmd.toString());
+
+        // Health check — wait for the container to accept connections
+        commands.add("for i in $(seq 1 20); do" +
+                " if curl -s --max-time 3 -o /dev/null http://127.0.0.1:" + hostPort + "; then" +
+                "   echo \"Container accepting connections (attempt $i)\"; exit 0;" +
+                " fi;" +
+                " sleep 3;" +
+                " done;" +
+                " echo 'Container never accepted connections. Last 100 log lines:';" +
+                " docker logs --tail 100 " + containerName + " 2>&1;" +
+                " exit 1");
+
+        progressLog.accept("📦 SSM command sent — " + commands.size() + " steps to execute on EC2");
 
         SendCommandResponse response = ssmClient.sendCommand(
                 SendCommandRequest.builder()
@@ -118,7 +176,7 @@ public class SSMDeployService {
                         .build()
         );
 
-        waitForCommand(ssmClient, instanceId, response.command().commandId());
+        waitForCommand(ssmClient, instanceId, response.command().commandId(), progressLog);
     }
 
     // =========================
@@ -179,7 +237,7 @@ public class SSMDeployService {
                         .build()
         );
 
-        waitForCommand(ssmClient, instanceId, response.command().commandId());
+        waitForCommand(ssmClient, instanceId, response.command().commandId(), NOOP_LOG);
     }
 
     // =========================
@@ -203,7 +261,7 @@ public class SSMDeployService {
                             .build()
             );
 
-            waitForCommand(ssmClient, instanceId, response.command().commandId());
+            waitForCommand(ssmClient, instanceId, response.command().commandId(), NOOP_LOG);
 
         } catch (RuntimeException e) {
             throw e; // already wrapped
@@ -214,9 +272,6 @@ public class SSMDeployService {
 
     // =========================
     // BUILD SSM CLIENT
-    // FIX 3: accept an already-built SsmClient from callers to avoid redundant
-    // assumeRole calls when the same client is reused within one operation.
-    // Public methods build the client once and pass it to private helpers.
     // =========================
     private SsmClient buildSsmClient(String roleArn, String region) throws Exception {
         AwsCredentialsDto creds = awsCredentialService.assumeRole(roleArn);
@@ -236,8 +291,7 @@ public class SSMDeployService {
     // =========================
     // WAIT FOR SSM AGENT ONLINE
     // =========================
-    private void waitForSSM(SsmClient ssmClient, String instanceId) throws Exception {
-        System.out.println("Waiting for SSM agent on " + instanceId + "...");
+    private void waitForSSM(SsmClient ssmClient, String instanceId, Consumer<String> progressLog) throws Exception {
 
         for (int i = 0; i < 120; i++) {
             try {
@@ -253,11 +307,16 @@ public class SSMDeployService {
 
                 if (!response.instanceInformationList().isEmpty()
                         && response.instanceInformationList().get(0).pingStatus() == PingStatus.ONLINE) {
-                    System.out.println("SSM agent ONLINE after " + (i * 5) + "s");
+                    progressLog.accept("✅ SSM agent online after " + (i * 5) + "s");
                     return;
                 }
 
             } catch (Exception ignored) {}
+
+            // Log progress every 15 seconds (every 3rd iteration of 5s)
+            if (i > 0 && i % 3 == 0) {
+                progressLog.accept("⏳ Waiting for SSM agent... (" + (i * 5) + "s elapsed)");
+            }
 
             Thread.sleep(5000);
         }
@@ -275,7 +334,8 @@ public class SSMDeployService {
     private void waitForCommand(
             SsmClient ssmClient,
             String instanceId,
-            String commandId
+            String commandId,
+            Consumer<String> progressLog
     ) throws Exception {
 
         for (int i = 0; i < POLL_ITERATIONS; i++) {
@@ -291,7 +351,6 @@ public class SSMDeployService {
                 CommandInvocationStatus status = response.status();
 
                 if (status == CommandInvocationStatus.SUCCESS) {
-                    System.out.println("SSM command succeeded");
                     return;
                 }
 
@@ -309,6 +368,11 @@ public class SSMDeployService {
                 }
 
                 // Status is IN_PROGRESS or PENDING — keep polling
+                // Log progress every 30 seconds (every ~8th iteration of 4s)
+                if (i > 0 && i % 8 == 0) {
+                    int elapsedSec = i * POLL_INTERVAL_MS / 1000;
+                    progressLog.accept("⏳ SSM command still running... (" + elapsedSec + "s elapsed)");
+                }
 
             } catch (InvocationDoesNotExistException ignored) {
                 // Command hasn't propagated to SSM yet — normal for first few polls

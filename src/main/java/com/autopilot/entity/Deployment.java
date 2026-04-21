@@ -41,6 +41,9 @@ public class Deployment {
 
     private String environment;
 
+    @Column(columnDefinition = "LONGTEXT")
+    private String customEnvVarsJson;
+
     // traffic estimate
     private Integer expectedUsers;
 
@@ -67,4 +70,35 @@ public class Deployment {
 
     @Column(name = "base_path")
     private String basePath;
+
+    @Column(name = "strategy_used")
+    private String strategyUsed;
+
+    @Column(name = "build_command")
+    private String buildCommand;
+
+    @Column(name = "start_command")
+    private String startCommand;
+
+    @Column(name = "runtime_version")
+    private String runtimeVersion;
+
+    // Config Intelligence results
+    @Column(name = "detected_databases")
+    private String detectedDatabases; // comma-separated: "mysql,postgres"
+
+    @Column(name = "detected_caches")
+    private String detectedCaches; // comma-separated: "redis,kafka"
+
+    @Column(name = "secret_count")
+    private Integer secretCount;
+
+    @Column(name = "env_var_count")
+    private Integer envVarCount;
+
+    @Column(name = "secrets_arn")
+    private String secretsArn; // AWS Secrets Manager ARN
+
+    @Column(name = "rds_endpoint")
+    private String rdsEndpoint; // auto-provisioned RDS endpoint
 }

@@ -127,10 +127,19 @@ public class TerraformService {
         pb.directory(dir.toFile());
         pb.redirectErrorStream(true);
 
-        // 🔥 CRITICAL: Use Terraform mirror
         Map<String, String> env = pb.environment();
-        env.put("TF_CLI_CONFIG_FILE", "/home/saksham/.terraformrc");
-
+        
+        // 🛑 CRITICAL PREVENTION OF `/tmp` TMPFS QUOTA EXHAUSTION
+        // By using a global terraform plugin cache, we download the 350MB+ Hashicorp plugins exactly once
+        // and magically symlink them into every isolated /tmp/autopilot-terraform/<uuid> workspace directory.
+        Path pluginCache = Path.of("/tmp/terraform-plugin-cache");
+        if (!Files.exists(pluginCache)) {
+            Files.createDirectories(pluginCache);
+        }
+        env.put("TF_PLUGIN_CACHE_DIR", pluginCache.toString());
+        
+        // Removed hardcoded /home/saksham/.terraformrc to fix 'Warning: Unable to open CLI configuration file'
+        
         Process p = pb.start();
 
         BufferedReader r =
@@ -153,6 +162,15 @@ public class TerraformService {
         }
 
         return out.toString();
+    }
+
+    public void cleanupWorkspace(String deploymentId) {
+        try {
+            Path terraformDir = Path.of(TERRAFORM_ROOT, deploymentId);
+            deleteDirectory(terraformDir);
+        } catch (Exception e) {
+            System.err.println("Failed to cleanup terraform workspace for " + deploymentId + ": " + e.getMessage());
+        }
     }
 
     private void deleteDirectory(Path path) throws Exception {

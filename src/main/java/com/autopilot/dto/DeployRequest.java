@@ -1,6 +1,7 @@
 package com.autopilot.dto;
 
 import lombok.Data;
+import java.util.Map;
 
 @Data
 public class DeployRequest {
@@ -21,4 +22,7 @@ public class DeployRequest {
     // AWS config
     private String awsRoleArn;
     private String awsRegion;
+
+    // Custom environment variables
+    private Map<String, String> envVars;
 }

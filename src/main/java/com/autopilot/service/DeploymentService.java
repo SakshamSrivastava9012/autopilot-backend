@@ -19,6 +19,7 @@ public class DeploymentService implements DeploymentServiceInterface {
 
     private final DeploymentRepository deploymentRepository;
     private final RedisQueueService redisQueueService;
+    private final com.fasterxml.jackson.databind.ObjectMapper objectMapper;
 
     @Override
     public Deployment createDeployment(DeployRequest request, User user) {
@@ -34,6 +35,14 @@ public class DeploymentService implements DeploymentServiceInterface {
         deployment.setExpectedUsers(request.getExpectedUsers());
         deployment.setAwsRoleArn(request.getAwsRoleArn());
         deployment.setAwsRegion(request.getAwsRegion());
+
+        if (request.getEnvVars() != null && !request.getEnvVars().isEmpty()) {
+            try {
+                deployment.setCustomEnvVarsJson(objectMapper.writeValueAsString(request.getEnvVars()));
+            } catch (Exception e) {
+                // Ignore serialization error for now
+            }
+        }
 
         deployment.setStatus(DeploymentStatus.PENDING.name());
 

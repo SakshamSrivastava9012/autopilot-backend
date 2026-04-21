@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:{{RUNTIME_VERSION}}-slim
 
 WORKDIR /app
 
@@ -10,4 +10,4 @@ COPY . .
 
 EXPOSE {{PORT}}
 
-CMD ["python","app.py"]
+CMD {{START_COMMAND}}

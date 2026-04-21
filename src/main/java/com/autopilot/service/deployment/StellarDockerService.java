@@ -11,25 +11,28 @@ public class StellarDockerService {
     private final StellarClient stellarClient;
 
     public String generateDockerfile(ServiceConfig service) {
-
-        String prompt = """
-Generate a production-ready Dockerfile.
-
-STRICT RULES:
-- Return ONLY Dockerfile
-- No explanation
-- No markdown
-- No extra text
-- Start with FROM
-- End with CMD
-
-Project:
-Framework: %s
-Port: %s
-""".formatted(
-                service.getFramework(),
-                service.getPort()
-        );
+        String prompt = String.format("""
+                You are a senior DevOps engineer. Generate a production-ready, highly optimized Dockerfile for a %s application.
+                
+                PROJECT DETAILS:
+                - Framework: %s
+                - Language: %s
+                - Build Command: %s
+                - Start Command: %s
+                - Port: %d
+                
+                DOCKERFILE RULES:
+                1. Use a standard lightweight base image (e.g., node:20-slim, eclipse-temurin:21-jre-alpine, python:3.10-slim).
+                2. Set WORKDIR to /app.
+                3. COPY the source code.
+                4. RUN the build command provided: %s.
+                5. EXPOSE the port: %d.
+                6. CMD must use the start command: %s.
+                7. Return ONLY the Dockerfile content. No explanations. No markdown.
+                """,
+                service.getFramework(), service.getFramework(), service.getLanguage(),
+                service.getBuildCommand(), service.getStartCommand(), service.getPort(),
+                service.getBuildCommand(), service.getPort(), service.getStartCommand());
 
         System.out.println("✨ Sending request to Stellar LLM...");
 

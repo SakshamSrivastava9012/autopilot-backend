@@ -38,10 +38,13 @@ public class NginxConfigService {
 
             config.append("    location ").append(path).append("/ {\n");
 
-            // ❌ NO REWRITE
-            // ❌ NO PATH STRIPPING
-
-            config.append("        proxy_pass http://127.0.0.1:").append(port).append(";\n");
+            if (path.endsWith("-api")) {
+                config.append("        proxy_pass http://127.0.0.1:").append(port).append("/;\n");
+            } else {
+                // ❌ NO REWRITE
+                // ❌ NO PATH STRIPPING
+                config.append("        proxy_pass http://127.0.0.1:").append(port).append(";\n");
+            }
 
             config.append("        proxy_http_version 1.1;\n");
             config.append("        proxy_set_header Host $host;\n");

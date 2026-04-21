@@ -56,9 +56,18 @@ resource "aws_iam_role_policy_attachment" "ecr_policy" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
 }
 
+resource "aws_iam_role_policy_attachment" "s3_policy" {
+  role       = aws_iam_role.ssm_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+}
+
 resource "aws_iam_instance_profile" "ssm_profile" {
   name = "autopilot-ssm-profile-${var.deployment_id}"
   role = aws_iam_role.ssm_role.name
+}
+
+data "aws_security_group" "default" {
+  name = "default"
 }
 
 resource "aws_instance" "autopilot_instance" {
@@ -69,12 +78,14 @@ resource "aws_instance" "autopilot_instance" {
   iam_instance_profile        = aws_iam_instance_profile.ssm_profile.name
 
   vpc_security_group_ids = [
-    aws_security_group.autopilot_sg.id
+    aws_security_group.autopilot_sg.id,
+    data.aws_security_group.default.id
   ]
 
   depends_on = [
     aws_iam_role_policy_attachment.ssm_policy,
     aws_iam_role_policy_attachment.ecr_policy,
+    aws_iam_role_policy_attachment.s3_policy,
     aws_iam_instance_profile.ssm_profile
   ]
 

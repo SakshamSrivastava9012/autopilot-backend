@@ -12,10 +12,12 @@ import java.util.stream.Collectors;
 public class FrameworkDetector {
 
     private final List<FrameworkPlugin> plugins = List.of(
-            new NodePlugin(),
-            new SpringBootPlugin(),
-            new com.autopilot.analyzer.plugins.PythonPlugin(),
-            new DockerPlugin()
+            new DockerPlugin(),      // Tier 1: Native Dockerfile (highest priority)
+            new SpringBootPlugin(),  // Java / Spring Boot
+            new NodePlugin(),        // Node.js / Next.js / React
+            new PythonPlugin(),      // Python / Flask / Django
+            new GoPlugin(),          // Go
+            new RustPlugin()         // Rust
     );
 
     public List<ServiceConfig> detect(List<String> files) {
@@ -33,6 +35,7 @@ public class FrameworkDetector {
 
         return services;
     }
+
     public List<ServiceConfig> detectWorkspace(Path workspace) throws Exception {
 
         List<String> files =

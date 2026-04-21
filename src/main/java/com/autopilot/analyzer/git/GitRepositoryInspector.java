@@ -8,13 +8,23 @@ import java.util.List;
 public class GitRepositoryInspector {
 
     public List<String> listFiles(String repoUrl, String branch) throws Exception {
+        try {
+            return executeListFiles(repoUrl, branch);
+        } catch (Exception e) {
+            System.out.println("⚠️ Branch '" + branch + "' not found for analysis. falling back to default branch...");
+            return executeListFiles(repoUrl, ""); // empty branch string in git ls-tree targets the default branch
+        }
+    }
 
+    private List<String> executeListFiles(String repoUrl, String branch) throws Exception {
         List<String> files = new ArrayList<>();
 
+        String target = (branch != null && !branch.isEmpty()) ? branch : "HEAD";
+        
         Process process = Runtime.getRuntime().exec(
                 new String[]{
                         "bash","-c",
-                        "git ls-tree -r --name-only " + repoUrl + " " + branch
+                        "git ls-tree -r --name-only " + repoUrl + " " + target
                 });
 
         BufferedReader reader =
@@ -23,13 +33,13 @@ public class GitRepositoryInspector {
                 );
 
         String line;
-
         while ((line = reader.readLine()) != null) {
-
             files.add(line);
         }
 
-        process.waitFor();
+        if (process.waitFor() != 0 && files.isEmpty()) {
+            throw new RuntimeException("git ls-tree failed");
+        }
 
         return files;
     }

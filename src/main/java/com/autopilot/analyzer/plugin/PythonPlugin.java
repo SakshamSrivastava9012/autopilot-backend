@@ -1,4 +1,4 @@
-package com.autopilot.analyzer.plugins;
+package com.autopilot.analyzer.plugin;
 
 import com.autopilot.analyzer.detectors.FrameworkPlugin;
 import com.autopilot.analyzer.model.ServiceConfig;
@@ -17,6 +17,9 @@ public class PythonPlugin implements FrameworkPlugin {
                 ServiceConfig service = new ServiceConfig();
 
                 service.setFramework("python");
+                service.setLanguage("python");
+                service.setStrategyUsed("TEMPLATE");
+                service.setRuntimeVersion("3.10");
                 service.setName("python-service");
 
                 service.setPath(file.replace("/requirements.txt",""));
