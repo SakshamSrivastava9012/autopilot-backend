@@ -1,0 +1,249 @@
+================================================================================
+           AUTOPILOT PLATFORM: DEEP DIVE ARCHITECTURE & ROUTING SPEC
+================================================================================
+
+This document details the low-level mechanics of the Autopilot Orchestration
+Engine (Deployrix). It covers container naming conventions, internal container
+execution logic, dynamic Nginx configuration generation, and SSM script traces.
+
+--------------------------------------------------------------------------------
+1. CONTAINER NAMING CONVENTIONS & NETWORK TOPOLOGY
+--------------------------------------------------------------------------------
+
+When a user triggers a deployment, Autopilot spins up multiple containers on
+the target host. All containers are bound to a shared user-defined Docker bridge
+network named 'autopilot'. This allows secure, isolated container-to-container
+communication.
+
+[CONTAINER NAME MAPPING RULES]
+* Base Path ID: Derived from the first 8 characters of the deployment's UUID
+  (e.g., deployment ID `37f5ef5b-6742-4b27-8966-43e51d466420` -> Base ID `37f5ef5b`).
+* Frontend Containers: Named `autopilot-{deploymentId}` (or `autopilot-{deploymentId}-web`)
+  Example: `autopilot-37f5ef5b`
+* Backend/API Containers: Suffix `-api` is appended.
+  Example: `autopilot-37f5ef5b-api`
+* Auxiliary / Database Containers: Common persistent naming convention.
+  - PostgreSQL: `autopilot-postgres`
+  - MySQL: `autopilot-mysql`
+  - MongoDB: `autopilot-mongo`
+  - Redis: `autopilot-redis`
+
+[IP & PORT ROUTING ARCHITECTURE]
+Inside the shared network, containers talk using Docker's internal DNS resolver:
+* The Backend Spring Boot application connects to PostgreSQL using the connection string:
+  `jdbc:postgresql://autopilot-postgres:5432/autopilotdb`
+* The Outer Reverse Proxy (running on the EC2 host) routes traffic from external users to the
+  respective container's mapped host ports.
+
+  External Traffic -> Host Port 80 (Nginx Proxy)
+                       |
+                       +---> Proxy Pass to 127.0.0.1:3103 (Mapped to Frontend container Port 80)
+                       |
+                       +---> Proxy Pass to 127.0.0.1:3104 (Mapped to Backend container Port 8080)
+
+--------------------------------------------------------------------------------
+2. INTERNAL CONTAINER MECHANICS (WHAT HAPPENS INSIDE)
+--------------------------------------------------------------------------------
+
+[A. STATIC SITE / SPA CONTAINERS (React, Angular, Vue, Vite)]
+For frontend React/Vite SPAs, the container runs its own internal Nginx instance to
+serve compiled static files (JS, CSS, HTML, SVGs).
+Because the outer reverse proxy routes frontend traffic with a base path prefix
+(e.g., `http://host/app-37f5ef5b/`), the inner container Nginx must strip this prefix
+before matching files in its local root directory (`/usr/share/nginx/html`).
+
+* Inner Container Nginx configuration:
+  ```nginx
+  server {
+      listen 80;
+      server_name localhost;
+      
+      # 1. Base Path Rewrite
+      # Strips the /app-37f5ef5b prefix transparently inside the container
+      rewrite ^/app-37f5ef5b(/?.*)$ $1 last;
+
+      # 2. Local File Serving
+      location / {
+          root /usr/share/nginx/html;
+          index index.html index.htm;
+          
+          # 3. SPA Fallback Routing
+          # Forces Nginx to forward routing requests to index.html so React Router takes over.
+          try_files $uri $uri/ /index.html;
+      }
+  }
+  ```
+
+[B. API / BACKEND CONTAINERS (Spring Boot, Express, Django)]
+Backend API containers run standard application servers (e.g., Tomcat for Spring Boot,
+Node for Express).
+* Database Environment Injection:
+  The pipeline automatically resolves credentials from AWS Secrets Manager and injects
+  them as container environment variables during start up:
+  - `DATABASE_URL` / `SPRING_DATASOURCE_URL`
+  - `DATABASE_USERNAME` / `SPRING_DATASOURCE_USERNAME`
+  - `DATABASE_PASSWORD` / `SPRING_DATASOURCE_PASSWORD`
+* Health Check Tolerances:
+  Spring Boot apps are verified at `/actuator/health` or `/`. Because security configurations
+  often block anonymous health requests, the health verifiers are configured to treat
+  401 (Unauthorized), 403 (Forbidden), 404 (Not Found), and 405 (Method Not Allowed)
+  responses as healthy, indicating the process has successfully started and bound to the port.
+
+--------------------------------------------------------------------------------
+3. DYNAMIC NGINX OUTER CONFIGURATION GENERATION
+--------------------------------------------------------------------------------
+
+The outer reverse proxy on the EC2 host runs a global Nginx container that acts as a router.
+The class `UniversalNginxGenerator.java` builds this configuration dynamically whenever
+deployments change.
+
+[THE GENERATED NGINX STRUCTURE]
+```nginx
+server {
+    listen 80;
+    server_name _;
+
+    client_max_body_size 100M;
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml;
+    proxy_buffering on;
+    proxy_buffer_size 128k;
+    proxy_buffers 4 256k;
+    proxy_busy_buffers_size 256k;
+
+    # Global Health Check for the EC2 instance load balancer
+    location /health {
+        return 200 'ok';
+        add_header Content-Type text/plain;
+    }
+
+    # ===================================================
+    # DEPLOYMENT: 37f5ef5b (Project: AI Prompt Vault)
+    # ===================================================
+
+    # 1. FRONTEND ROUTE (React Vite SPA)
+    # Target Host Port: 3103 (Mapped to Container Port 80)
+    # Strip Prefix: Enabled (Trailing slash on proxy_pass strips the matched prefix path)
+    location /app-37f5ef5b/ {
+        proxy_pass http://127.0.0.1:3103/;
+        
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Port $server_port;
+        proxy_set_header X-Forwarded-Prefix /app-37f5ef5b;
+        proxy_set_header Forwarded "for=$remote_addr;proto=$scheme;host=$host;by=$server_addr";
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+
+    # 2. BACKEND/API ROUTE (Spring Boot API)
+    # Target Host Port: 3104 (Mapped to Container Port 8080)
+    # Strip Prefix: Disabled (Requests are forwarded exactly as received)
+    location /app-37f5ef5b-api/ {
+        proxy_pass http://127.0.0.1:3104;
+        
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Port $server_port;
+        proxy_set_header X-Forwarded-Prefix /app-37f5ef5b-api;
+        proxy_set_header Forwarded "for=$remote_addr;proto=$scheme;host=$host;by=$server_addr";
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+
+    # Default fallback for unmatched routes
+    location / {
+        return 404;
+    }
+}
+```
+
+--------------------------------------------------------------------------------
+4. SSM DEPLOYMENT EXECUTION SCRIPT TRACE
+--------------------------------------------------------------------------------
+
+When `SSMDeployService` executes a deployment on the EC2 host via AWS Systems Manager
+(SSM) run commands, the following shell scripts are executed sequentially:
+
+[STEP 1: PREPARATION & PRUNING]
+```bash
+# Ensure target network exists
+docker network create autopilot || true
+
+# Login to AWS ECR using AWS credentials resolved by the pipeline
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 123456789012.dkr.ecr.us-east-1.amazonaws.com
+```
+
+[STEP 2: RUN DATABASE/AUXILIARY CONTAINERS]
+```bash
+# If database is required, start PostgreSQL container if not already running
+docker run -d \
+  --name autopilot-postgres \
+  --network autopilot \
+  -e POSTGRES_DB=autopilotdb \
+  -e POSTGRES_USER=autopilot \
+  -e POSTGRES_PASSWORD=securepassword \
+  -p 5432:5432 \
+  postgres:15 || true
+```
+
+[STEP 3: RUN THE APPLICATION CONTAINERS]
+```bash
+# 1. Stop and remove existing container for this deployment ID
+docker stop autopilot-37f5ef5b || true
+docker rm autopilot-37f5ef5b || true
+
+# 2. Pull latest image from registry
+docker pull 123456789012.dkr.ecr.us-east-1.amazonaws.com/autopilot-frontend:37f5ef5b
+
+# 3. Launch Frontend container mapping internal port 80 to host port 3103
+docker run -d \
+  --name autopilot-37f5ef5b \
+  --network autopilot \
+  -p 3103:80 \
+  123456789012.dkr.ecr.us-east-1.amazonaws.com/autopilot-frontend:37f5ef5b
+
+# 4. Stop and remove API container
+docker stop autopilot-37f5ef5b-api || true
+docker rm autopilot-37f5ef5b-api || true
+
+# 5. Pull latest API image
+docker pull 123456789012.dkr.ecr.us-east-1.amazonaws.com/autopilot-backend:37f5ef5b
+
+# 6. Launch Backend container mapping internal port 8080 to host port 3104
+# Note environment variables injected from Secrets Manager
+docker run -d \
+  --name autopilot-37f5ef5b-api \
+  --network autopilot \
+  -p 3104:8080 \
+  -e DATABASE_URL=jdbc:postgresql://autopilot-postgres:5432/autopilotdb \
+  -e DATABASE_USERNAME=autopilot \
+  -e DATABASE_PASSWORD=securepassword \
+  123456789012.dkr.ecr.us-east-1.amazonaws.com/autopilot-backend:37f5ef5b
+```
+
+[STEP 4: UPDATE OUTER NGINX CONFIGURATION]
+```bash
+# 1. Write the dynamically generated Nginx config block to temporary file
+cat << 'EOF' > /tmp/nginx.conf
+# [UniversalNginxGenerator config goes here]
+EOF
+
+# 2. Move file to host Nginx mount directory
+sudo mv /tmp/nginx.conf /etc/nginx/conf.d/default.conf
+
+# 3. Test config and reload Nginx reload
+docker exec global-nginx nginx -t && docker exec global-nginx nginx -s reload
+```
+
+================================================================================
+                                 END OF FILE
+================================================================================

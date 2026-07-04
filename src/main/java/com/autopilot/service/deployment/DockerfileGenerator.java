@@ -1,87 +1,77 @@
 package com.autopilot.service.deployment;
 
+import com.autopilot.analyzer.model.FrameworkMetadata;
+import com.autopilot.analyzer.model.FrameworkType;
+import com.autopilot.analyzer.model.PackageManager;
+import com.autopilot.analyzer.model.RuntimeType;
 import com.autopilot.analyzer.model.ServiceConfig;
+import com.autopilot.service.deployment.strategies.RuntimeStrategy;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
 import java.io.FileWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 
 /**
- * Production-grade Dockerfile generator with 4-tier fallback strategy.
- *
- * Tier 1: Use native Dockerfile from repo (skip generation)
- * Tier 2: Use framework template with placeholder substitution
- * Tier 3: Use AI (Stellar LLM) to generate Dockerfile
- * Tier 4: Generate deterministic fallback Dockerfile from ServiceConfig
- *
- * NEVER throws an exception. Always writes a usable Dockerfile.
+ * Production-grade Dockerfile generator refactored to use the Strategy Pattern.
  */
 @Component
 @RequiredArgsConstructor
 public class DockerfileGenerator {
 
+    private final List<RuntimeStrategy> strategies;
     private final DockerTemplateLoader templateLoader;
     private final StellarDockerService stellarDockerService;
 
     public void generate(ServiceConfig service) throws Exception {
+        // Convert ServiceConfig to FrameworkMetadata for backward compatibility
+        FrameworkMetadata metadata = convertToMetadata(service);
+        generateForMetadata(metadata, service.getPath());
+    }
 
-        String dockerfile = null;
-
-        System.out.println("━━━ DockerfileGenerator ━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        System.out.println("  Framework: " + service.getFramework());
-        System.out.println("  Language:  " + service.getLanguage());
-        System.out.println("  Runtime:   " + service.getRuntimeVersion());
-        System.out.println("  Build:     " + service.getBuildCommand());
-        System.out.println("  Start:     " + service.getStartCommand());
+    public void generateForMetadata(FrameworkMetadata metadata, String targetPath) throws Exception {
+        System.out.println("━━━ DockerfileGenerator (Strategy) ━━━━━━━━━━━━━━━━━━");
+        System.out.println("  Framework: " + metadata.getFrameworkType());
+        System.out.println("  Runtime:   " + metadata.getRuntimeType());
+        System.out.println("  Build:     " + metadata.getBuildCommand());
+        System.out.println("  Start:     " + metadata.getStartCommand());
         System.out.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-        // ── TIER 1: Skip if Dockerfile already exists in repo ────────────
-        if (service.isDockerfileExists()) {
+        if (metadata.isDockerfileExists()) {
             System.out.println("✅ TIER 1: Native Dockerfile found → skipping generation");
             return;
         }
 
-        // ── TIER 2: Framework template with placeholder substitution ─────
-        try {
-            dockerfile = templateLoader.loadTemplate(service.getFramework());
-            dockerfile = replacePlaceholders(dockerfile, service);
-            System.out.println("✅ TIER 2: Template loaded and placeholders replaced");
-        } catch (Exception templateError) {
-            System.out.println("⚠️ TIER 2 Failed: " + templateError.getMessage());
+        // Resolve Dockerfile via strategy
+        String dockerfile = null;
+        RuntimeStrategy strategy = strategies.stream()
+                .filter(s -> s.supports(metadata.getRuntimeType()))
+                .findFirst()
+                .orElse(null);
+
+        if (strategy != null) {
+            dockerfile = strategy.generateDockerfile(metadata);
         }
 
-        // ── TIER 3: AI Generation (only if template failed) ──────────────
-        if (dockerfile == null || dockerfile.isBlank() || !dockerfile.contains("FROM")) {
-            try {
-                System.out.println("🤖 TIER 3: Requesting Dockerfile from Stellar AI...");
-                dockerfile = stellarDockerService.generateDockerfile(service);
-                if (dockerfile != null && dockerfile.contains("FROM")) {
-                    System.out.println("✅ TIER 3: AI Dockerfile generated");
-                } else {
-                    dockerfile = null; // Force fallback
-                }
-            } catch (Exception aiError) {
-                System.err.println("⚠️ TIER 3 Failed: " + aiError.getMessage());
-            }
+        // If strategy failed or generated nothing, use Generic fallback strategy
+        if (dockerfile == null || dockerfile.isBlank()) {
+            System.out.println("🛡️ Fallback: Using Generic strategy");
+            RuntimeStrategy fallbackStrategy = strategies.stream()
+                    .filter(s -> s.supports(RuntimeType.GENERIC))
+                    .findFirst()
+                    .orElseThrow(() -> new RuntimeException("Generic strategy not found"));
+            dockerfile = fallbackStrategy.generateDockerfile(metadata);
         }
 
-        // ── TIER 4: Deterministic fallback (NEVER FAILS) ─────────────────
-        if (dockerfile == null || dockerfile.isBlank() || !dockerfile.contains("FROM")) {
-            System.out.println("🛡️ TIER 4: Generating deterministic fallback Dockerfile");
-            dockerfile = generateFallbackDockerfile(service);
-        }
-
-        // ── WRITE ────────────────────────────────────────────────────────
-        Path servicePath = Path.of(service.getPath()).toAbsolutePath().normalize();
-
+        // Write Dockerfile to directory
+        Path servicePath = Path.of(targetPath).toAbsolutePath().normalize();
         if (Files.isRegularFile(servicePath)) {
             servicePath = servicePath.getParent();
         }
 
         Files.createDirectories(servicePath);
-
         Path dockerfilePath = servicePath.resolve("Dockerfile");
 
         System.out.println("📝 Writing Dockerfile to: " + dockerfilePath);
@@ -94,120 +84,66 @@ public class DockerfileGenerator {
         }
     }
 
-    /**
-     * Replace all template placeholders with actual values from ServiceConfig.
-     */
-    private String replacePlaceholders(String dockerfile, ServiceConfig service) {
-        String port = service.getPort() != null ? service.getPort().toString() : "8080";
-        String runtime = service.getRuntimeVersion() != null ? service.getRuntimeVersion() : "17";
-        String buildCmd = service.getBuildCommand() != null ? service.getBuildCommand() : "echo 'no build'";
-        String startCmd = service.getStartCommand() != null ? service.getStartCommand() : "echo 'no start'";
+    private FrameworkMetadata convertToMetadata(ServiceConfig service) {
+        // Map ServiceConfig string types to enums safely
+        FrameworkType ft = FrameworkType.GENERIC;
+        try {
+            if (service.getFramework() != null) {
+                ft = FrameworkType.valueOf(service.getFramework().toUpperCase().replace("-", "_"));
+            }
+        } catch (Exception ignored) {}
 
-        return dockerfile
-                .replace("{{PORT}}", port)
-                .replace("{{RUNTIME_VERSION}}", runtime)
-                .replace("{{BUILD_COMMAND}}", buildCmd)
-                .replace("{{START_COMMAND}}", startCmd);
-    }
+        RuntimeType rt = RuntimeType.GENERIC;
+        if (service.getDeploymentManifest() != null && service.getDeploymentManifest().getRuntime() != null) {
+            String runtime = service.getDeploymentManifest().getRuntime().toUpperCase();
+            if (runtime.contains("STATIC")) rt = RuntimeType.STATIC;
+            else if (runtime.contains("SSR")) rt = RuntimeType.SSR;
+            else if (runtime.contains("NODE")) rt = RuntimeType.NODE_SERVER;
+            else if (runtime.contains("JAVA")) rt = RuntimeType.JAVA_JAR;
+            else if (runtime.contains("PYTHON")) rt = RuntimeType.PYTHON;
+            else if (runtime.contains("GO")) rt = RuntimeType.GO_BINARY;
+            else if (runtime.contains("RUST")) rt = RuntimeType.RUST_BINARY;
+        } else {
+            String lang = service.getLanguage() != null ? service.getLanguage().toLowerCase() : "";
+            if (lang.contains("java")) rt = RuntimeType.JAVA_JAR;
+            else if (lang.contains("javascript") || lang.contains("node") || lang.contains("typescript")) {
+                rt = RuntimeType.NODE_SERVER;
+            } else if (lang.contains("python")) rt = RuntimeType.PYTHON;
+            else if (lang.contains("go")) rt = RuntimeType.GO_BINARY;
+            else if (lang.contains("rust")) rt = RuntimeType.RUST_BINARY;
+        }
 
-    /**
-     * Generate a deterministic fallback Dockerfile based on detected language.
-     * Uses multi-tool base images that include build tools.
-     * This method NEVER fails — it always returns a valid Dockerfile string.
-     */
-    private String generateFallbackDockerfile(ServiceConfig service) {
+        PackageManager pm = PackageManager.NONE;
+        if (service.getDeploymentManifest() != null && service.getDeploymentManifest().getPackageManager() != null) {
+            try {
+                pm = PackageManager.valueOf(service.getDeploymentManifest().getPackageManager().toUpperCase());
+            } catch (Exception ignored) {}
+        } else {
+            String build = service.getBuildCommand() != null ? service.getBuildCommand().toLowerCase() : "";
+            if (build.contains("mvn")) pm = PackageManager.MAVEN;
+            else if (build.contains("gradle")) pm = PackageManager.GRADLE;
+            else if (build.contains("npm")) pm = PackageManager.NPM;
+            else if (build.contains("yarn")) pm = PackageManager.YARN;
+            else if (build.contains("pnpm")) pm = PackageManager.PNPM;
+            else if (build.contains("pip")) pm = PackageManager.PIP;
+        }
 
-        String lang = service.getLanguage() != null ? service.getLanguage().toLowerCase() : "unknown";
-        String runtime = service.getRuntimeVersion() != null ? service.getRuntimeVersion() : "";
-        String buildCmd = service.getBuildCommand() != null ? service.getBuildCommand() : "echo 'skipping build'";
-        String startCmd = service.getStartCommand() != null ? service.getStartCommand() : "echo 'no start command detected'";
-        int port = service.getPort() != null ? service.getPort() : 8080;
-
-        return switch (lang) {
-            case "java" -> generateJavaFallback(runtime, buildCmd, port);
-            case "javascript", "node", "typescript" -> generateNodeFallback(runtime, buildCmd, startCmd, port);
-            case "python" -> generatePythonFallback(runtime, buildCmd, startCmd, port);
-            case "go" -> generateGoFallback(runtime, port);
-            default -> generateUniversalFallback(buildCmd, startCmd, port);
-        };
-    }
-
-    private String generateJavaFallback(String runtime, String buildCmd, int port) {
-        String version = runtime.isBlank() ? "17" : runtime;
-        return """
-                FROM maven:3.9.9-eclipse-temurin-%s AS builder
-                WORKDIR /build
-                COPY . .
-                RUN chmod +x mvnw gradlew 2>/dev/null || true
-                RUN %s
-                FROM eclipse-temurin:%s-jre
-                WORKDIR /app
-                COPY --from=builder /build/target/*.jar app.jar
-                EXPOSE %d
-                ENTRYPOINT ["java", "-jar", "app.jar"]
-                """.formatted(version, buildCmd, version, port);
-    }
-
-    private String generateNodeFallback(String runtime, String buildCmd, String startCmd, int port) {
-        String version = runtime.isBlank() ? "20" : runtime;
-        return """
-                FROM node:%s-alpine
-                WORKDIR /app
-                COPY package*.json ./
-                RUN npm install
-                COPY . .
-                RUN %s
-                EXPOSE %d
-                CMD %s
-                """.formatted(version, buildCmd, port, startCmd);
-    }
-
-    private String generatePythonFallback(String runtime, String buildCmd, String startCmd, int port) {
-        String version = runtime.isBlank() ? "3.10" : runtime;
-        return """
-                FROM python:%s-slim
-                WORKDIR /app
-                COPY requirements.txt .
-                RUN pip install --no-cache-dir -r requirements.txt || true
-                COPY . .
-                EXPOSE %d
-                CMD %s
-                """.formatted(version, port, startCmd);
-    }
-
-    private String generateGoFallback(String runtime, int port) {
-        String version = runtime.isBlank() ? "1.22" : runtime;
-        return """
-                FROM golang:%s-alpine AS builder
-                WORKDIR /build
-                COPY . .
-                RUN go build -o /app/server .
-                FROM alpine:3.19
-                WORKDIR /app
-                COPY --from=builder /app/server .
-                EXPOSE %d
-                CMD ["./server"]
-                """.formatted(version, port);
-    }
-
-    /**
-     * Universal fallback — installs Java + Node + Python and tries all build tools.
-     * This is the absolute last resort. It WILL produce a runnable container.
-     */
-    private String generateUniversalFallback(String buildCmd, String startCmd, int port) {
-        return """
-                FROM ubuntu:22.04
-                ENV DEBIAN_FRONTEND=noninteractive
-                RUN apt-get update && apt-get install -y \\
-                    openjdk-17-jdk maven \\
-                    nodejs npm \\
-                    python3 python3-pip \\
-                    && rm -rf /var/lib/apt/lists/*
-                WORKDIR /app
-                COPY . .
-                RUN %s || echo "Build step failed — continuing anyway"
-                EXPOSE %d
-                CMD %s
-                """.formatted(buildCmd, port, startCmd);
+        FrameworkMetadata metadata = FrameworkMetadata.builder()
+                .name(service.getName())
+                .frameworkType(ft)
+                .runtimeType(rt)
+                .packageManager(pm)
+                .buildCommand(service.getBuildCommand())
+                .startCommand(service.getStartCommand())
+                .outputDirectory(service.getDeploymentManifest() != null ? service.getDeploymentManifest().getOutputDirectory() : "dist")
+                .port(service.getPort() != null ? service.getPort() : 8080)
+                .healthCheckPath(service.getDeploymentManifest() != null ? service.getDeploymentManifest().getHealthCheckPath() : "/")
+                .language(service.getLanguage())
+                .defaultRuntimeVersion(service.getRuntimeVersion())
+                .dockerfileExists(service.isDockerfileExists())
+                .basePath(service.getBasePath())
+                .build();
+        metadata.validate();
+        return metadata;
     }
 }

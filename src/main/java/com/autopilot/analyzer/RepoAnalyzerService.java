@@ -1,283 +1,277 @@
 package com.autopilot.analyzer;
 
-import com.autopilot.analyzer.detectors.FrameworkDetector;
+import com.autopilot.analyzer.model.FrameworkMetadata;
 import com.autopilot.analyzer.model.RepoAnalysisResult;
 import com.autopilot.analyzer.model.ServiceConfig;
+import com.autopilot.analyzer.model.DeploymentManifest;
+import com.autopilot.analyzer.detectors.DetectorUtils;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
 import java.nio.file.*;
-import java.util.List;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.*;
 import java.util.stream.Collectors;
 
-/**
- * Production-grade Repository Analyzer with 4-tier detection.
- *
- * Tier 1: Native Dockerfile (validate before using)
- * Tier 2: Rule-based framework plugins
- * Tier 3: AI analysis via Stellar LLM
- * Tier 4: Generic fallback (NEVER FAILS)
- *
- * After detection, performs:
- * - Java version extraction from pom.xml/build.gradle
- * - Dockerfile validation
- * - Confidence scoring adjustment
- */
 @Service
 @RequiredArgsConstructor
 public class RepoAnalyzerService {
 
-    private final UniversalAnalyzerService universalAnalyzer;
+    private final RepositoryDiscoveryService discoveryService;
+    private final ProjectClassifier projectClassifier;
+    private final ServiceClassifier serviceClassifier;
+    private final com.autopilot.service.deployment.validation.StrategyResolver strategyResolver;
 
     public RepoAnalysisResult analyzeWorkspace(Path workspace) throws Exception {
-
         RepoAnalysisResult result = new RepoAnalysisResult();
 
-        List<String> files =
-                Files.walk(workspace)
-                        .filter(Files::isRegularFile)
-                        .map(path -> workspace.relativize(path).toString())
-                        .collect(Collectors.toList());
+        // 1. Log the repository tree
+        System.out.println("🌳 --- REPOSITORY TREE ---");
+        List<String> treeLines = new ArrayList<>();
+        treeLines.add(workspace.getFileName() != null ? workspace.getFileName().toString() : "workspace");
+        printDirectoryTree(workspace, "", 1, treeLines);
+        treeLines.forEach(System.out::println);
+        System.out.println("🌳 -----------------------");
 
-        System.out.println("📂 Workspace contains " + files.size() + " files");
+        // 2. Discover service roots
+        Set<Path> finalServiceDirs = discoveryService.discoverServiceRoots(workspace);
+        System.out.println("🔍 Discovered service directory roots: " + finalServiceDirs);
 
-        result.setDockerized(files.stream().anyMatch(f -> f.endsWith("Dockerfile")));
-
-        // ── TIER 1: RULE-BASED TEMPLATES (MONOREPO AWARE) ───────────────
-        FrameworkDetector ruleDetector = new FrameworkDetector();
-        List<ServiceConfig> templateServices = ruleDetector.detect(files);
-
-        // Filter out DockerPlugin results (since we check for native Dockerfile later if needed)
-        templateServices = templateServices.stream()
-                .filter(s -> !"DOCKERFILE".equals(s.getStrategyUsed()))
+        // Walk workspace to collect files for detectors
+        List<String> files = Files.walk(workspace)
+                .filter(Files::isRegularFile)
+                .filter(path -> {
+                    for (Path element : workspace.relativize(path)) {
+                        String name = element.toString();
+                        if (name.equals("node_modules") || name.equals(".git") ||
+                            name.equals("target") || name.equals("build") || name.equals(".gradle")) {
+                            return false;
+                        }
+                    }
+                    return true;
+                })
+                .map(path -> workspace.relativize(path).toString())
                 .collect(Collectors.toList());
 
-        if (!templateServices.isEmpty()) {
-            if (templateServices.size() > 1) {
-                // Monorepo fully detected!
-                System.out.println("📋 TIER 1: MULTIPLE Frameworks Detected (Monorepo) → " + templateServices.size() + " services");
-                for (ServiceConfig s : templateServices) {
-                    if ("java".equals(s.getLanguage())) {
-                        String detectedVersion = detectJavaVersion(workspace, files);
-                        if (detectedVersion != null) s.setRuntimeVersion(detectedVersion);
+        result.setDockerized(files.stream().anyMatch(f -> f.endsWith("Dockerfile")));
+        List<ServiceConfig> detectedServices = new ArrayList<>();
+
+        for (Path serviceDir : finalServiceDirs) {
+            Path subWorkspace = workspace.resolve(serviceDir);
+
+            // Collect files belonging only to this service directory (excluding child sub-services)
+            List<String> dirFiles = new ArrayList<>();
+            for (String file : files) {
+                Path filePath = Path.of(file);
+                boolean underServiceDir = serviceDir.toString().isEmpty() || filePath.startsWith(serviceDir);
+                if (underServiceDir) {
+                    boolean belongsToSubService = false;
+                    for (Path otherDir : finalServiceDirs) {
+                        if (!otherDir.equals(serviceDir) && isNested(otherDir, serviceDir) && filePath.startsWith(otherDir)) {
+                            belongsToSubService = true;
+                            break;
+                        }
                     }
-                    if (s.isDockerfileExists()) {
-                        String cleanPath = (s.getPath() == null || s.getPath().equals(".") || s.getPath().equals("/")) ? "" : s.getPath();
-                        Path dockerfilePath = workspace.resolve(cleanPath).resolve("Dockerfile").normalize();
-                        Integer exPort = extractPortFromDockerfileOrNull(dockerfilePath);
-                        if (exPort != null) s.setPort(exPort);
-                    }
-                }
-                result.setServices(templateServices);
-                result.setMonoRepo(true);
-                return result;
-            } else {
-                ServiceConfig primary = templateServices.get(0);
-                if ("java".equals(primary.getLanguage())) {
-                    String detectedVersion = detectJavaVersion(workspace, files);
-                    if (detectedVersion != null) {
-                        primary.setRuntimeVersion(detectedVersion);
-                        System.out.println("🔍 Detected Java version from pom.xml: " + detectedVersion);
+                    if (!belongsToSubService) {
+                        Path relPath = serviceDir.toString().isEmpty() ? filePath : serviceDir.relativize(filePath);
+                        dirFiles.add(relPath.toString());
                     }
                 }
-                if (primary.isDockerfileExists()) {
-                    String cleanPath = (primary.getPath() == null || primary.getPath().equals(".") || primary.getPath().equals("/")) ? "" : primary.getPath();
-                    Path dockerfilePath = workspace.resolve(cleanPath).resolve("Dockerfile").normalize();
-                    Integer exPort = extractPortFromDockerfileOrNull(dockerfilePath);
-                    if (exPort != null) primary.setPort(exPort);
-                }
-                System.out.println("📋 TIER 1: Template detected → " + primary.getFramework()
-                        + " (runtime: " + primary.getRuntimeVersion() + ")");
-                result.setServices(templateServices);
-                result.setMonoRepo(false);
-                return result;
             }
-        }
 
-        // ── TIER 2: NATIVE DOCKERFILE (SINGLE SERVICE FALLBACK) ──────────
-        for (String file : files) {
-            if (file.equals("Dockerfile") || file.endsWith("/Dockerfile")) {
-                Path dockerfilePath = workspace.resolve(file);
-                if (validateNativeDockerfile(dockerfilePath)) {
-                    ServiceConfig dockerSvc = new ServiceConfig();
-                    dockerSvc.setStrategyUsed("DOCKERFILE");
-                    dockerSvc.setFramework("docker");
-                    dockerSvc.setName("docker-service");
-                    dockerSvc.setConfidence(100);
+            // Perform framework classification
+            FrameworkMetadata metadata = projectClassifier.classifyProject(subWorkspace, dirFiles);
 
-                    String path = file.replace("/Dockerfile", "").replace("Dockerfile", ".");
-                    dockerSvc.setPath(path);
-                    dockerSvc.setDockerfileExists(true);
+            if (metadata != null) {
+                ServiceConfig serviceConfig = new ServiceConfig();
+                String serviceId = serviceDir.toString().isEmpty() || serviceDir.toString().equals(".")
+                        ? metadata.getName()
+                        : serviceDir.getFileName().toString();
 
-                    // Try to extract EXPOSE port from native Dockerfile
-                    dockerSvc.setPort(extractPortFromDockerfile(dockerfilePath));
+                serviceConfig.setServiceId(serviceId);
+                serviceConfig.setServiceRoot(subWorkspace.toAbsolutePath().normalize().toString());
+                serviceConfig.setRepositoryRoot(workspace.toAbsolutePath().normalize().toString());
+                serviceConfig.setDockerContext(subWorkspace.toAbsolutePath().normalize().toString());
+                serviceConfig.setDockerfileLocation(subWorkspace.resolve("Dockerfile").toAbsolutePath().normalize().toString());
 
-                    System.out.println("💎 TIER 2: Valid native Dockerfile at " + path);
-                    result.setServices(List.of(dockerSvc));
-                    return result;
+                serviceConfig.setFramework(metadata.getFrameworkType().name().toLowerCase());
+                serviceConfig.setLanguage(metadata.getLanguage());
+                serviceConfig.setRuntime(metadata.getRuntimeType().name());
+                serviceConfig.setPackageManager(metadata.getPackageManager().name());
+                serviceConfig.setBuildCommand(metadata.getBuildCommand());
+                serviceConfig.setStartCommand(metadata.getStartCommand());
+                serviceConfig.setPort(metadata.getPort());
+
+                String outDir = metadata.getOutputDirectory();
+                if (outDir != null && !outDir.equals(".")) {
+                    serviceConfig.setArtifactLocation(subWorkspace.resolve(outDir).toAbsolutePath().normalize().toString());
                 } else {
-                    System.out.println("⚠️ TIER 2: Dockerfile found but INVALID — skipping");
+                    serviceConfig.setArtifactLocation(subWorkspace.toAbsolutePath().normalize().toString());
                 }
+
+                String version = metadata.getDefaultRuntimeVersion();
+                if ("java".equals(metadata.getLanguage())) {
+                    String detectedJava = projectClassifier.detectJavaVersion(subWorkspace, dirFiles);
+                    if (detectedJava != null) {
+                        version = detectedJava;
+                    }
+                }
+                serviceConfig.setRuntimeVersion(version);
+                serviceConfig.setStrategyUsed("STRATEGY_" + metadata.getFrameworkType().name());
+                serviceConfig.setDockerfileExists(metadata.isDockerfileExists());
+
+                // Assign the architectural role
+                serviceConfig.setRole(serviceClassifier.classifyRole(serviceConfig));
+
+                // Resolve FrameworkStrategy and populate validation metadata fields
+                com.autopilot.service.deployment.validation.FrameworkStrategy strategy = strategyResolver.resolve(serviceConfig);
+                serviceConfig.setBuildContext(serviceConfig.getServiceRoot());
+                serviceConfig.setExpectedManifestFiles(strategy.expectedManifestFiles());
+                serviceConfig.setDockerStrategy(strategy.getClass().getSimpleName().replace("FrameworkStrategy", "DockerStrategy"));
+                serviceConfig.setValidatorStrategy(strategy.getClass().getSimpleName().replace("FrameworkStrategy", "Validator"));
+
+                // Build deployment manifest
+                DeploymentManifest manifest = DeploymentManifest.builder()
+                        .framework(metadata.getFrameworkType().name().toLowerCase())
+                        .runtime(metadata.getRuntimeType().name())
+                        .packageManager(metadata.getPackageManager().name())
+                        .installCommand(DetectorUtils.getInstallCommand(metadata.getPackageManager()))
+                        .buildCommand(metadata.getBuildCommand())
+                        .startCommand(metadata.getStartCommand())
+                        .outputDirectory(metadata.getOutputDirectory())
+                        .healthCheckPath(metadata.getHealthCheckPath())
+                        .port(metadata.getPort())
+                        .environmentVariables(new HashMap<>())
+                        .build();
+
+                serviceConfig.setDeploymentManifest(manifest);
+                detectedServices.add(serviceConfig);
             }
         }
 
-        // ── TIER 3: AI REFLECTION (LLM) ──────────────────────────────────
-        try {
-            System.out.println("🤖 TIER 3: Consulting Stellar AI...");
-            ServiceConfig aiDetect = universalAnalyzer.analyzeTree(files);
-            if (aiDetect != null && aiDetect.getFramework() != null) {
-                aiDetect.setStrategyUsed("AI_GENERATED");
-                if (aiDetect.getConfidence() == null) aiDetect.setConfidence(60);
-
-                System.out.println("✅ TIER 3: AI detected → " + aiDetect.getFramework());
-                result.setServices(List.of(aiDetect));
-                return result;
-            }
-        } catch (Exception e) {
-            System.err.println("⚠️ TIER 3 Failed: " + e.getMessage());
+        if (detectedServices.isEmpty()) {
+            throw new RuntimeException("No deployable services detected in repository");
         }
 
-        // ── TIER 4: GENERIC FALLBACK (NEVER FAILS) ──────────────────────
-        System.out.println("🛡️ TIER 4: Using generic fallback");
-        ServiceConfig fallback = buildGenericFallback(files);
-        result.setServices(List.of(fallback));
+        validateServices(workspace, detectedServices);
+
+        result.setServices(detectedServices);
+        result.setMonoRepo(detectedServices.size() > 1);
+
+        System.out.println("✅ Detection complete. Found " + detectedServices.size() + " services");
         return result;
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    //  HELPER METHODS
-    // ════════════════════════════════════════════════════════════════════════
+    private void validateServices(Path repositoryRoot, List<ServiceConfig> services) {
+        System.out.println("📋 --- WORKSPACE ISOLATION REPORT ---");
+        System.out.println("Repository Root: " + repositoryRoot.toAbsolutePath().normalize());
+        System.out.println("Detected Services:");
 
-    /**
-     * Validate that a native Dockerfile contains the minimum required instructions.
-     */
-    private boolean validateNativeDockerfile(Path dockerfilePath) {
-        try {
-            String content = Files.readString(dockerfilePath);
-            return content.contains("FROM") && (content.contains("CMD") || content.contains("ENTRYPOINT"));
-        } catch (IOException e) {
-            return false;
-        }
-    }
+        for (ServiceConfig s : services) {
+            Path root = Path.of(s.getServiceRoot()).toAbsolutePath().normalize();
+            Path context = Path.of(s.getDockerContext()).toAbsolutePath().normalize();
+            Path dockerfile = Path.of(s.getDockerfileLocation()).toAbsolutePath().normalize();
 
-    /**
-     * Extract EXPOSE port from a Dockerfile.
-     */
-     private Integer extractPortFromDockerfile(Path dockerfilePath) {
-        Integer extracted = extractPortFromDockerfileOrNull(dockerfilePath);
-        return extracted != null ? extracted : 8080; // safe default
-    }
-
-    private Integer extractPortFromDockerfileOrNull(Path dockerfilePath) {
-        try {
-            String content = Files.readString(dockerfilePath);
-            Matcher m = Pattern.compile("EXPOSE\\s+(\\d+)").matcher(content);
-            if (m.find()) {
-                return Integer.parseInt(m.group(1));
+            List<String> manifestsFound = new ArrayList<>();
+            List<String> manifestCandidates = List.of(
+                    "package.json", "pom.xml", "build.gradle", "build.gradle.kts",
+                    "go.mod", "requirements.txt", "Pipfile", "pyproject.toml",
+                    "Cargo.toml", "composer.json", "Gemfile", "Dockerfile"
+            );
+            for (String manifest : manifestCandidates) {
+                if (Files.exists(root.resolve(manifest))) {
+                    manifestsFound.add(manifest);
+                }
             }
-        } catch (Exception ignored) {}
-        return null;
-    }
 
-    /**
-     * Detect the Java version from pom.xml or build.gradle.
-     * Scans for <java.version>, <maven.compiler.source>, or sourceCompatibility.
-     */
-    private String detectJavaVersion(Path workspace, List<String> files) {
-        // Try pom.xml first
-        for (String file : files) {
-            if (file.endsWith("pom.xml")) {
-                try {
-                    String content = Files.readString(workspace.resolve(file));
+            System.out.println("  • Service ID: " + s.getServiceId() + " [Role: " + s.getRole() + "]");
+            System.out.println("    serviceRoot: " + root);
+            System.out.println("    dockerContext: " + context);
+            System.out.println("    dockerfile: " + dockerfile);
+            System.out.println("    manifest files found: " + manifestsFound);
 
-                    // Pattern 1: <java.version>21</java.version>
-                    Matcher m1 = Pattern.compile("<java\\.version>(\\d+)</java\\.version>").matcher(content);
-                    if (m1.find()) return m1.group(1);
+            if (!Files.exists(root)) {
+                throw new IllegalStateException("Invariant failed: serviceRoot does not exist: " + root);
+            }
+            if (!Files.isDirectory(root)) {
+                throw new IllegalStateException("Invariant failed: serviceRoot is not a directory: " + root);
+            }
+            if (!context.equals(root)) {
+                throw new IllegalStateException("Invariant failed: dockerContext (" + context + ") must equal serviceRoot (" + root + ")");
+            }
 
-                    // Pattern 2: <maven.compiler.source>17</maven.compiler.source>
-                    Matcher m2 = Pattern.compile("<maven\\.compiler\\.source>(\\d+)</maven\\.compiler\\.source>").matcher(content);
-                    if (m2.find()) return m2.group(1);
+            validateExpectedManifest(s, root);
+        }
 
-                    // Pattern 3: <release>21</release>
-                    Matcher m3 = Pattern.compile("<release>(\\d+)</release>").matcher(content);
-                    if (m3.find()) return m3.group(1);
-
-                } catch (IOException e) {
-                    System.err.println("⚠️ Could not read pom.xml for version detection: " + e.getMessage());
+        // Reject identical service roots
+        for (int i = 0; i < services.size(); i++) {
+            Path rootI = Path.of(services.get(i).getServiceRoot()).toAbsolutePath().normalize();
+            for (int j = i + 1; j < services.size(); j++) {
+                Path rootJ = Path.of(services.get(j).getServiceRoot()).toAbsolutePath().normalize();
+                if (rootI.equals(rootJ)) {
+                    throw new IllegalStateException("Invariant failed: Duplicate service roots detected between Service '"
+                            + services.get(i).getServiceId() + "' and Service '"
+                            + services.get(j).getServiceId() + "' (" + rootI + ")");
                 }
             }
         }
+        System.out.println("📋 ----------------------------------");
+    }
 
-        // Try build.gradle
-        for (String file : files) {
-            if (file.endsWith("build.gradle")) {
-                try {
-                    String content = Files.readString(workspace.resolve(file));
+    private void validateExpectedManifest(ServiceConfig service, Path root) {
+        List<String> expected = service.getExpectedManifestFiles();
+        if (expected == null || expected.isEmpty()) {
+            return;
+        }
 
-                    // Pattern: sourceCompatibility = '17' or sourceCompatibility = 17
-                    Matcher m = Pattern.compile("sourceCompatibility\\s*=\\s*['\"]?(\\d+)").matcher(content);
-                    if (m.find()) return m.group(1);
-
-                    // Pattern: JavaVersion.VERSION_21
-                    Matcher m2 = Pattern.compile("JavaVersion\\.VERSION_(\\d+)").matcher(content);
-                    if (m2.find()) return m2.group(1);
-
-                } catch (IOException e) {
-                    System.err.println("⚠️ Could not read build.gradle for version detection: " + e.getMessage());
+        boolean found = false;
+        for (String m : expected) {
+            if (m.contains("*")) {
+                try (var stream = Files.find(root, 1, (p, attr) -> p.getFileName().toString().endsWith(m.substring(1)))) {
+                    if (stream.findFirst().isPresent()) {
+                        found = true;
+                        break;
+                    }
+                } catch (IOException ignored) {}
+            } else {
+                if (Files.exists(root.resolve(m))) {
+                    found = true;
+                    break;
                 }
             }
         }
-
-        return null; // use plugin default
+        if (!found) {
+            throw new IllegalStateException("Invariant failed: expected manifest file (one of " + expected + ") is missing in serviceRoot: " + root);
+        }
     }
 
-    /**
-     * Build a generic fallback ServiceConfig by guessing from file extensions.
-     */
-    private ServiceConfig buildGenericFallback(List<String> files) {
-        ServiceConfig fb = new ServiceConfig();
-        fb.setName("generic-app");
-        fb.setFramework("generic");
-        fb.setStrategyUsed("FALLBACK");
-        fb.setPath(".");
-        fb.setPort(8080);
-        fb.setConfidence(20);
-
-        // Try to guess language from file extensions
-        long javaCount = files.stream().filter(f -> f.endsWith(".java")).count();
-        long jsCount = files.stream().filter(f -> f.endsWith(".js") || f.endsWith(".ts")).count();
-        long pyCount = files.stream().filter(f -> f.endsWith(".py")).count();
-        long goCount = files.stream().filter(f -> f.endsWith(".go")).count();
-
-        if (javaCount > jsCount && javaCount > pyCount && javaCount > goCount) {
-            fb.setLanguage("java");
-            fb.setRuntimeVersion("17");
-            fb.setBuildCommand("mvn clean package -DskipTests");
-            fb.setStartCommand("java -jar target/*.jar");
-        } else if (jsCount > pyCount && jsCount > goCount) {
-            fb.setLanguage("javascript");
-            fb.setRuntimeVersion("20");
-            fb.setBuildCommand("npm install && npm run build");
-            fb.setStartCommand("[\"npm\", \"start\"]");
-        } else if (pyCount > goCount) {
-            fb.setLanguage("python");
-            fb.setRuntimeVersion("3.10");
-            fb.setBuildCommand("pip install -r requirements.txt || true");
-            fb.setStartCommand("[\"python\", \"app.py\"]");
-        } else if (goCount > 0) {
-            fb.setLanguage("go");
-            fb.setRuntimeVersion("1.22");
-            fb.setBuildCommand("go build -o server .");
-            fb.setStartCommand("[\"./server\"]");
-        } else {
-            fb.setLanguage("unknown");
-            fb.setBuildCommand("echo 'Unknown project — skipping build'");
-            fb.setStartCommand("[\"ls\", \"-la\"]");
+    private boolean isNested(Path child, Path parent) {
+        if (parent.toString().isEmpty() || parent.toString().equals(".")) {
+            return !child.toString().isEmpty() && !child.toString().equals(".");
         }
+        return child.startsWith(parent) && !child.equals(parent);
+    }
 
-        return fb;
+    private void printDirectoryTree(Path dir, String prefix, int depth, List<String> treeLines) {
+        if (depth > 4) return;
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir)) {
+            List<Path> paths = new ArrayList<>();
+            for (Path p : stream) {
+                String name = p.getFileName().toString();
+                if (!name.startsWith(".") && !name.equals("node_modules") && !name.equals("target") && !name.equals("build")) {
+                    paths.add(p);
+                }
+            }
+            paths.sort(Comparator.comparing(Path::toString));
+            for (int i = 0; i < paths.size(); i++) {
+                Path p = paths.get(i);
+                boolean isLast = (i == paths.size() - 1);
+                String line = prefix + (isLast ? "└── " : "├── ") + p.getFileName().toString();
+                treeLines.add(line);
+                if (Files.isDirectory(p)) {
+                    printDirectoryTree(p, prefix + (isLast ? "    " : "│   "), depth + 1, treeLines);
+                }
+            }
+        } catch (IOException ignored) {}
     }
 }

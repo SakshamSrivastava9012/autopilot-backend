@@ -1,8 +1,8 @@
 provider "aws" {
   region     = var.region
-  access_key = var.access_key
-  secret_key = var.secret_key
-  token      = var.session_token
+  access_key = var.access_key != "" ? var.access_key : null
+  secret_key = var.secret_key != "" ? var.secret_key : null
+  token      = var.session_token != "" ? var.session_token : null
 }
 
 resource "aws_security_group" "autopilot_sg" {
@@ -66,10 +66,6 @@ resource "aws_iam_instance_profile" "ssm_profile" {
   role = aws_iam_role.ssm_role.name
 }
 
-data "aws_security_group" "default" {
-  name = "default"
-}
-
 resource "aws_instance" "autopilot_instance" {
   ami           = var.ami_id
   instance_type = var.instance_type
@@ -78,8 +74,7 @@ resource "aws_instance" "autopilot_instance" {
   iam_instance_profile        = aws_iam_instance_profile.ssm_profile.name
 
   vpc_security_group_ids = [
-    aws_security_group.autopilot_sg.id,
-    data.aws_security_group.default.id
+    aws_security_group.autopilot_sg.id
   ]
 
   depends_on = [
@@ -163,5 +158,15 @@ EOF
   tags = {
     Name = "autopilot-${var.deployment_id}"
   }
+}
+
+resource "aws_security_group_rule" "allow_ec2_to_rds" {
+  count                    = var.rds_security_group_id != "" ? 1 : 0
+  type                     = "ingress"
+  from_port                = var.rds_port
+  to_port                  = var.rds_port
+  protocol                 = "tcp"
+  security_group_id        = var.rds_security_group_id
+  source_security_group_id = aws_security_group.autopilot_sg.id
 }
 

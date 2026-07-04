@@ -67,9 +67,24 @@ public class DeploymentLogService {
 
     // ───────────────────────────── helpers ────────────────────────────
 
+    public static String sanitizeMessage(String msg) {
+        if (msg == null) return null;
+        // 1. Mask RDS auto-generated master password patterns like: APxxxxxx!
+        msg = msg.replaceAll("AP[a-zA-Z0-9]{16}!", "[REDACTED_PASSWORD]");
+        // 2. Mask local fallback password patterns like: APxxxxxx
+        msg = msg.replaceAll("AP[a-zA-Z0-9]{10}", "[REDACTED_PASSWORD]");
+        // 3. Mask passwords in connection strings (e.g. mysql://user:pass@host:port/db)
+        msg = msg.replaceAll("([a-zA-Z0-9]+://[^:]+:)([^@\\s]+)(@.+)", "$1[REDACTED_PASSWORD]$3");
+        // 4. Mask AWS credentials and password variables (e.g. password=xyz)
+        msg = msg.replaceAll("(?i)(aws_access_key_id|aws_secret_access_key|accesskey|secretkey|password|pass|pwd)\\s*[=:]\\s*['\"]?[a-zA-Z0-9/+=]{10,40}['\"]?", "$1=[REDACTED]");
+        return msg;
+    }
+
     private void writeLog(String deploymentId, String stage, String level, String message) {
+        String sanitizedMessage = sanitizeMessage(message);
+        
         // 1. Persist to DB
-        DeploymentLog entry = new DeploymentLog(deploymentId, stage, level, message);
+        DeploymentLog entry = new DeploymentLog(deploymentId, stage, level, sanitizedMessage);
         logRepository.save(entry);
 
         // 2. Publish JSON payload to Redis pub/sub
@@ -81,7 +96,7 @@ public class DeploymentLogService {
         }
 
         // 3. Also log to server console for ops visibility
-        log.info("[{}] [{}] [{}] {}", deploymentId, stage, level, message);
+        log.info("[{}] [{}] [{}] {}", deploymentId, stage, level, sanitizedMessage);
     }
 
     private void publishToRedis(String deploymentId, String payload) {

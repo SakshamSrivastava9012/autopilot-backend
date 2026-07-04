@@ -1,69 +1,106 @@
 package com.autopilot.service.infrastructure;
 
 import com.autopilot.entity.Deployment;
+import com.autopilot.dto.DeploymentManifest;
+import com.autopilot.dto.RouteDescriptor;
+import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
 
 @Service
+@RequiredArgsConstructor
 public class NginxConfigService {
 
+    private final UniversalNginxGenerator nginxGenerator;
+
     public String generateConfig(List<Deployment> deployments) {
+        validateDeployments(deployments);
+        return nginxGenerator.generate(deployments);
+    }
 
-        StringBuilder config = new StringBuilder();
-
-        config.append("server {\n");
-        config.append("    listen 80;\n");
-        config.append("    server_name _;\n\n");
-
-        config.append("    location /health {\n");
-        config.append("        return 200 'ok';\n");
-        config.append("        add_header Content-Type text/plain;\n");
-        config.append("    }\n\n");
+    public void validateDeployments(List<Deployment> deployments) {
+        java.util.Map<String, String> basePathToService = new java.util.HashMap<>();
+        java.util.Map<Integer, String> portToService = new java.util.HashMap<>();
+        java.util.Set<String> serviceIds = new java.util.HashSet<>();
 
         for (Deployment d : deployments) {
-
-            if (d == null
-                    || d.getAssignedPort() == null
-                    || d.getBasePath() == null
-                    || d.getBasePath().isBlank()) {
+            if (d == null || "DESTROYED".equalsIgnoreCase(d.getStatus())) {
                 continue;
             }
 
-            String path = d.getBasePath().trim();
-            int port = d.getAssignedPort();
-
-            if (!path.startsWith("/")) path = "/" + path;
-            if (path.endsWith("/")) path = path.substring(0, path.length() - 1);
-
-            config.append("    location ").append(path).append("/ {\n");
-
-            if (path.endsWith("-api")) {
-                config.append("        proxy_pass http://127.0.0.1:").append(port).append("/;\n");
+            DeploymentManifest manifest = UniversalNginxGenerator.parseDeploymentManifest(d.getDeployedServicesJson());
+            if (manifest != null && manifest.getRoutes() != null) {
+                for (RouteDescriptor route : manifest.getRoutes()) {
+                    validateService(route.getTargetService(), route.getPath(), route.getInternalPort(), d.getId(), basePathToService, portToService, serviceIds);
+                }
             } else {
-                // ❌ NO REWRITE
-                // ❌ NO PATH STRIPPING
-                config.append("        proxy_pass http://127.0.0.1:").append(port).append(";\n");
+                List<com.autopilot.dto.DeployedService> svcs = UniversalNginxGenerator.parseDeployedServices(d.getDeployedServicesJson());
+                if (svcs != null && !svcs.isEmpty()) {
+                    for (com.autopilot.dto.DeployedService svc : svcs) {
+                        validateService(svc.getName(), svc.getBasePath(), svc.getHostPort(), d.getId(), basePathToService, portToService, serviceIds);
+                    }
+                } else if (d.getAssignedPort() != null && d.getAssignedPort() > 0 && d.getBasePath() != null) {
+                    validateService(d.getId(), d.getBasePath(), d.getAssignedPort(), d.getId(), basePathToService, portToService, serviceIds);
+                }
             }
+        }
+    }
 
-            config.append("        proxy_http_version 1.1;\n");
-            config.append("        proxy_set_header Host $host;\n");
-            config.append("        proxy_set_header X-Real-IP $remote_addr;\n");
-            config.append("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n");
-            config.append("        proxy_set_header X-Forwarded-Proto $scheme;\n");
-
-            config.append("        proxy_set_header Upgrade $http_upgrade;\n");
-            config.append("        proxy_set_header Connection \"upgrade\";\n");
-
-            config.append("    }\n\n");
+    private void validateService(
+            String serviceId,
+            String basePath,
+            int port,
+            String deploymentId,
+            java.util.Map<String, String> basePathToService,
+            java.util.Map<Integer, String> portToService,
+            java.util.Set<String> serviceIds
+    ) {
+        if (serviceId == null || basePath == null || basePath.isBlank() || port <= 0) {
+            return;
         }
 
-        config.append("    location / {\n");
-        config.append("        return 404;\n");
-        config.append("    }\n");
+        String normPath = basePath.trim();
+        if (!normPath.startsWith("/")) normPath = "/" + normPath;
+        if (normPath.endsWith("/")) normPath = normPath.substring(0, normPath.length() - 1);
 
-        config.append("}\n");
+        if ("/health".equals(normPath)) {
+            triggerDuplicateError("Base Path (Reserved for System Health Checks)", normPath,
+                    "Service " + serviceId + " in deployment " + deploymentId + " attempted to reserve '/health'.");
+        }
 
-        return config.toString();
+        String globalServiceId = deploymentId + ":" + serviceId;
+        if (serviceIds.contains(globalServiceId)) {
+            triggerDuplicateError("Service ID", serviceId,
+                    "Service " + serviceId + " in deployment " + deploymentId + " is duplicate.");
+        }
+        serviceIds.add(globalServiceId);
+
+        if (basePathToService.containsKey(normPath)) {
+            triggerDuplicateError("Base Path (Location)", normPath,
+                    "Service " + serviceId + " conflicts with Service " + basePathToService.get(normPath));
+        }
+        basePathToService.put(normPath, serviceId);
+
+        if (portToService.containsKey(port)) {
+            triggerDuplicateError("Port (Upstream)", String.valueOf(port),
+                    "Service " + serviceId + " conflicts with Service " + portToService.get(port));
+        }
+        portToService.put(port, serviceId);
+    }
+
+    private void triggerDuplicateError(String entityType, String entityValue, String conflictDetail) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Architectural Route Generation Violation Detected!\n");
+        sb.append("Conflicting Services: ").append(conflictDetail).append("\n");
+        sb.append("Conflict Type: Duplicate ").append(entityType).append("\n");
+        sb.append("Value: ").append(entityValue).append("\n");
+        sb.append("Source Class: com.autopilot.service.infrastructure.NginxConfigService\n");
+        sb.append("Source Method: generateConfig\n");
+        sb.append("Call Stack:\n");
+        for (StackTraceElement ste : Thread.currentThread().getStackTrace()) {
+            sb.append("  at ").append(ste.toString()).append("\n");
+        }
+        throw new RuntimeException(sb.toString());
     }
 }

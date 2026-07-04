@@ -19,6 +19,12 @@ import java.util.List;
 @Component
 public class DockerBuilder {
 
+    private final com.autopilot.service.deployment.validation.BuildContextValidator buildContextValidator;
+
+    public DockerBuilder(com.autopilot.service.deployment.validation.BuildContextValidator buildContextValidator) {
+        this.buildContextValidator = buildContextValidator;
+    }
+
     /**
      * Result of a Docker build attempt.
      */
@@ -59,10 +65,31 @@ public class DockerBuilder {
             // path resolution failed — use as-is
         }
 
-        String command = "docker build --no-cache -t " + imageName + " " + path;
+        path = path.toAbsolutePath().normalize();
 
+        // 1. Validate Build Context before running the build
+        try {
+            buildContextValidator.validate(service);
+        } catch (Exception e) {
+            String errorMsg = "❌ Build Context Validation FAILED: " + e.getMessage();
+            System.err.println(errorMsg);
+            buildLogs.add(errorMsg);
+            return new BuildResult(false, imageName, buildLogs, "INVALID_BUILD_CONTEXT");
+        }
+
+        String dockerfilePath = path.resolve("Dockerfile").toAbsolutePath().normalize().toString();
+        String command = "docker build --no-cache -f " + dockerfilePath + " -t " + imageName + " " + path.toString();
+
+        System.out.println("🐳 Docker Build Validation:");
+        System.out.println("docker build \\");
+        System.out.println("  -f " + dockerfilePath + " \\");
+        System.out.println("  -t " + imageName + " \\");
+        System.out.println("  " + path.toString());
+        System.out.println("Absolute BUILD_CONTEXT: " + path.toString());
         System.out.println("🚀 Running: " + command);
+        
         buildLogs.add("CMD: " + command);
+        buildLogs.add("Absolute BUILD_CONTEXT: " + path.toString());
 
         try {
             ProcessBuilder pb = new ProcessBuilder("bash", "-c", command);
@@ -96,6 +123,8 @@ public class DockerBuilder {
             return new BuildResult(false, imageName, buildLogs, "UNKNOWN");
         }
     }
+
+    // Build context validation is now delegated to the service-scoped BuildContextValidator strategy
 
     /**
      * Legacy build method — throws on failure. Used by simple callers.

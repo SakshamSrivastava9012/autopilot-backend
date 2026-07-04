@@ -26,21 +26,19 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class SecretsManagerService {
 
-    private final AwsCredentialService awsCredentialService;
-
     /**
      * Store all detected secrets as a single AWS Secrets Manager secret.
      *
      * @param deploymentId Unique deployment identifier (used as secret name)
      * @param secrets      List of detected ConfigEntry objects marked as secret
-     * @param roleArn      AWS IAM Role ARN to assume
+     * @param creds        AWS Credentials DTO
      * @param region       AWS Region
      * @return The ARN of the created secret
      */
     public String storeSecrets(
             String deploymentId,
             List<ConfigEntry> secrets,
-            String roleArn,
+            AwsCredentialsDto creds,
             String region
     ) {
         if (secrets == null || secrets.isEmpty()) {
@@ -49,7 +47,7 @@ public class SecretsManagerService {
         }
 
         try {
-            SecretsManagerClient client = buildClient(roleArn, region);
+            SecretsManagerClient client = buildClient(creds, region);
 
             String secretName = "autopilot/" + deploymentId;
 
@@ -99,9 +97,9 @@ public class SecretsManagerService {
     /**
      * Retrieve secrets from AWS Secrets Manager.
      */
-    public Map<String, String> getSecrets(String deploymentId, String roleArn, String region) {
+    public Map<String, String> getSecrets(String deploymentId, AwsCredentialsDto creds, String region) {
         try {
-            SecretsManagerClient client = buildClient(roleArn, region);
+            SecretsManagerClient client = buildClient(creds, region);
 
             GetSecretValueResponse response = client.getSecretValue(
                     GetSecretValueRequest.builder()
@@ -120,8 +118,13 @@ public class SecretsManagerService {
         }
     }
 
-    private SecretsManagerClient buildClient(String roleArn, String region) throws Exception {
-        AwsCredentialsDto creds = awsCredentialService.assumeRole(roleArn);
+    private SecretsManagerClient buildClient(AwsCredentialsDto creds, String region) {
+        if (creds == null) {
+            // Fallback to local default credential provider chain
+            return SecretsManagerClient.builder()
+                    .region(Region.of(region))
+                    .build();
+        }
 
         AwsSessionCredentials sessionCredentials = AwsSessionCredentials.create(
                 creds.getAccessKeyId(),

@@ -1,12 +1,18 @@
 package com.autopilot.service.infrastructure;
 
+import com.autopilot.analyzer.model.RepoAnalysisResult;
+import com.autopilot.service.deployment.intelligence.InstanceSelector;
+import com.autopilot.service.deployment.intelligence.ProjectAnalysis;
+import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
 @Service
+@RequiredArgsConstructor
 public class CapacityPlanner {
 
-    public String chooseInstanceType(Integer expectedUsers) {
+    private final InstanceSelector instanceSelector;
 
+    public String chooseInstanceType(Integer expectedUsers) {
         if (expectedUsers == null) {
             return "t3.micro";
         }
@@ -25,4 +31,16 @@ public class CapacityPlanner {
 
         return "t3.large";
     }
+
+    public String chooseInstanceType(RepoAnalysisResult analysis, Integer expectedUsers) {
+        if (analysis == null) {
+            return chooseInstanceType(expectedUsers);
+        }
+        ProjectAnalysis proj = ProjectAnalysis.builder()
+                .repoAnalysis(analysis)
+                .expectedUsers(expectedUsers)
+                .build();
+        return instanceSelector.recommend(proj).getInstanceType();
+    }
 }
+

@@ -13,3 +13,13 @@ variable "instance_type" {}
 variable "app_port" {}
 
 variable "ami_id" {}
+
+variable "rds_security_group_id" {
+  type    = string
+  default = ""
+}
+
+variable "rds_port" {
+  type    = number
+  default = 3306
+}

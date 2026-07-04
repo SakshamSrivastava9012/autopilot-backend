@@ -23,7 +23,6 @@ import java.util.List;
 public class SecurityConfig {
 
     private final JwtAuthFilter jwtAuthFilter;
-    private final OAuth2SuccessHandler oauth2SuccessHandler;
 
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
@@ -35,16 +34,14 @@ public class SecurityConfig {
                 // Public endpoints
                 .requestMatchers(
                     "/api/auth/**",
-                    "/oauth2/**",
-                    "/login/oauth2/**",
                     "/error",
-                    "/deploy/**"
+                    "/health"
                 ).permitAll()
-                // Everything else requires a valid JWT
+                // SSE log stream uses ?token= query param for auth (EventSource can't set headers)
+                // JwtAuthFilter already validates the token — this just lets the request through Spring Security
+                .requestMatchers("/deploy/*/logs/stream").permitAll()
+                // Everything else (including /deploy) requires a valid JWT
                 .anyRequest().authenticated()
-            )
-            .oauth2Login(oauth2 -> oauth2
-                .successHandler(oauth2SuccessHandler)
             )
             .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
 
@@ -62,8 +59,10 @@ public class SecurityConfig {
         config.setAllowedOrigins(List.of(
             "http://localhost:3000",
             "http://localhost:3001",
+            "http://localhost:5173",
             "http://127.0.0.1:3000",
-            "http://127.0.0.1:3001"
+            "http://127.0.0.1:3001",
+            "http://127.0.0.1:5173"
         ));
         config.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS"));
         config.setAllowedHeaders(List.of("*"));

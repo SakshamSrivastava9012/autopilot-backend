@@ -5,5 +5,13 @@ import java.util.List;
 
 public interface FrameworkPlugin {
 
-    ServiceConfig detect(List<String> files);
+    List<ServiceConfig> detect(List<String> files);
+
+    default boolean supports(String language, String framework) {
+        return false;
+    }
+
+    default String generateDockerfileFallback(ServiceConfig service) {
+        return null;
+    }
 }

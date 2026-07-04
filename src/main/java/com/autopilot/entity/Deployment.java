@@ -52,6 +52,10 @@ public class Deployment {
 
     private String awsRegion;
 
+    // MANAGED or BYOC
+    @Column(name = "deployment_mode")
+    private String deploymentMode;
+
     private String awsAccountId;
 
     private String ec2KeyPath;
@@ -64,6 +68,9 @@ public class Deployment {
 
     // NEW FIELD
     private String ec2InstanceId;
+
+    @Column(name = "instance_type_override")
+    private String instanceTypeOverride;
 
     @Column(name = "assigned_port")
     private Integer assignedPort;
@@ -101,4 +108,8 @@ public class Deployment {
 
     @Column(name = "rds_endpoint")
     private String rdsEndpoint; // auto-provisioned RDS endpoint
+
+    @Column(name = "deployed_services_json", columnDefinition = "LONGTEXT")
+    private String deployedServicesJson;
 }
+

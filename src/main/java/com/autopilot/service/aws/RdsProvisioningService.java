@@ -1,6 +1,7 @@
 package com.autopilot.service.aws;
 
 import com.autopilot.dto.AwsCredentialsDto;
+import com.autopilot.service.deployment.runtime.dependency.*;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
@@ -28,8 +29,6 @@ import java.util.function.Consumer;
 @RequiredArgsConstructor
 public class RdsProvisioningService {
 
-    private final AwsCredentialService awsCredentialService;
-
     /**
      * Result of RDS provisioning.
      */
@@ -41,6 +40,7 @@ public class RdsProvisioningService {
             String database,
             String username,
             String password,
+            String rdsSecurityGroupId,
             Map<String, String> envVars
     ) {}
 
@@ -49,12 +49,12 @@ public class RdsProvisioningService {
      *
      * @param dbType       "mysql" or "postgres"
      * @param deploymentId Unique deployment ID
-     * @param roleArn      AWS IAM Role ARN
+     * @param creds        AWS credentials DTO
      * @param region       AWS Region
      * @param progressLog  Callback for real-time log messages (sent to frontend)
      * @return RdsResult with connection info and env vars, or null if unsupported
      */
-    public RdsResult provision(String dbType, String deploymentId, String roleArn, String region,
+    public RdsResult provision(String dbType, String deploymentId, AwsCredentialsDto creds, String region,
                                Consumer<String> progressLog) {
 
         if (dbType == null) return null;
@@ -82,12 +82,14 @@ public class RdsProvisioningService {
 
         String shortId = deploymentId.replace("-", "").substring(0, 8);
         String dbInstanceId = "autopilot-" + shortId;
-        String dbName = "autopilotdb";
-        String masterUser = "autopilot";
-        String masterPass = "AP" + UUID.randomUUID().toString().replace("-", "").substring(0, 16) + "!";
+
+        RuntimeDatabaseConfiguration dbConfig = RuntimeDatabaseConfigRegistry.getOrCreate(dbType, "autopilotdb");
+        String dbName = dbConfig.databaseName();
+        String masterUser = dbConfig.username();
+        String masterPass = dbConfig.password();
 
         try {
-            RdsClient rdsClient = buildClient(roleArn, region);
+            RdsClient rdsClient = buildClient(creds, region);
 
             progressLog.accept("🗄️ RDS: Provisioning " + engine + " " + engineVersion + " instance...");
 
@@ -131,6 +133,23 @@ public class RdsProvisioningService {
             // Wait for the instance to become available
             String endpoint = waitForEndpoint(rdsClient, dbInstanceId, progressLog);
 
+            String rdsSecurityGroupId = null;
+            try {
+                DescribeDbInstancesResponse describeResponse = rdsClient.describeDBInstances(
+                        DescribeDbInstancesRequest.builder()
+                                .dbInstanceIdentifier(dbInstanceId)
+                                .build()
+                );
+                if (!describeResponse.dbInstances().isEmpty()) {
+                    DBInstance instance = describeResponse.dbInstances().get(0);
+                    if (instance.vpcSecurityGroups() != null && !instance.vpcSecurityGroups().isEmpty()) {
+                        rdsSecurityGroupId = instance.vpcSecurityGroups().get(0).vpcSecurityGroupId();
+                    }
+                }
+            } catch (Exception sgEx) {
+                progressLog.accept("⚠️ RDS Security Group fetch warning: " + sgEx.getMessage());
+            }
+
             rdsClient.close();
 
             // Build connection URL
@@ -160,7 +179,7 @@ public class RdsProvisioningService {
 
             progressLog.accept("🗄️ RDS: ✅ Ready at " + endpoint + ":" + dbPort);
 
-            return new RdsResult(dbInstanceId, engine, endpoint, dbPort, dbName, masterUser, masterPass, envVars);
+            return new RdsResult(dbInstanceId, engine, endpoint, dbPort, dbName, masterUser, masterPass, rdsSecurityGroupId, envVars);
 
         } catch (Exception e) {
             progressLog.accept("⚠️ RDS: Provisioning failed — " + e.getMessage());
@@ -206,8 +225,13 @@ public class RdsProvisioningService {
         throw new RuntimeException("RDS endpoint not available after 10 minutes");
     }
 
-    private RdsClient buildClient(String roleArn, String region) throws Exception {
-        AwsCredentialsDto creds = awsCredentialService.assumeRole(roleArn);
+    private RdsClient buildClient(AwsCredentialsDto creds, String region) {
+        if (creds == null) {
+            // Fallback to local default credential provider chain
+            return RdsClient.builder()
+                    .region(Region.of(region))
+                    .build();
+        }
 
         AwsSessionCredentials sessionCredentials = AwsSessionCredentials.create(
                 creds.getAccessKeyId(),

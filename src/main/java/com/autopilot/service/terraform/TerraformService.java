@@ -2,7 +2,6 @@ package com.autopilot.service.terraform;
 
 import com.autopilot.dto.AwsCredentialsDto;
 import com.autopilot.dto.TerraformResult;
-import com.autopilot.service.aws.AwsCredentialService;
 import com.autopilot.service.infrastructure.CapacityPlanner;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -16,24 +15,19 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class TerraformService {
 
-    private final AwsCredentialService awsCredentialService;
     private final CapacityPlanner capacityPlanner;
 
     private static final String TERRAFORM_ROOT = "/tmp/autopilot-terraform";
 
     public TerraformResult provisionInfrastructure(
-            String roleArn,
+            AwsCredentialsDto creds,
             String region,
-            Integer expectedUsers,
+            String instanceType,
             int appPort,
-            String deploymentId
+            String deploymentId,
+            String rdsSecurityGroupId,
+            Integer rdsPort
     ) throws Exception {
-
-        AwsCredentialsDto creds =
-                awsCredentialService.assumeRole(roleArn);
-
-        String instanceType =
-                capacityPlanner.chooseInstanceType(expectedUsers);
 
         Path terraformDir =
                 Path.of(TERRAFORM_ROOT, deploymentId);
@@ -71,15 +65,25 @@ public class TerraformService {
 
         Path tfvars = terraformDir.resolve("terraform.tfvars");
 
+        // Ubuntu 22.04 LTS AMIs per region (amd64, hvm:ebs-ssd)
+        // These should be updated periodically or replaced with dynamic lookup
+        String amiId = getUbuntuAmi(region);
+
+        String accessKeyVal = creds != null ? creds.getAccessKeyId() : "";
+        String secretKeyVal = creds != null ? creds.getSecretAccessKey() : "";
+        String sessionTokenVal = creds != null ? creds.getSessionToken() : "";
+
         String content =
                 "region=\"" + region + "\"\n" +
-                        "access_key=\"" + creds.getAccessKeyId() + "\"\n" +
-                        "secret_key=\"" + creds.getSecretAccessKey() + "\"\n" +
-                        "session_token=\"" + creds.getSessionToken() + "\"\n" +
+                        "access_key=\"" + accessKeyVal + "\"\n" +
+                        "secret_key=\"" + secretKeyVal + "\"\n" +
+                        "session_token=\"" + sessionTokenVal + "\"\n" +
                         "instance_type=\"" + instanceType + "\"\n" +
                         "app_port=" + appPort + "\n" +
                         "deployment_id=\"" + deploymentId + "\"\n" +
-                        "ami_id=\"ami-0f5ee92e2d63afc18\"";
+                        "ami_id=\"" + amiId + "\"\n" +
+                        "rds_security_group_id=\"" + (rdsSecurityGroupId != null ? rdsSecurityGroupId : "") + "\"\n" +
+                        "rds_port=" + (rdsPort != null ? rdsPort : 3306);
 
         Files.writeString(tfvars, content);
 
@@ -164,6 +168,59 @@ public class TerraformService {
         return out.toString();
     }
 
+    public void destroyInfrastructure(
+            AwsCredentialsDto creds,
+            String region,
+            int appPort,
+            String deploymentId
+    ) throws Exception {
+
+        Path terraformDir =
+                Path.of(TERRAFORM_ROOT, deploymentId);
+
+        // Recreate directory and copy templates if missing (e.g. reboot/cleanup)
+        if (!Files.exists(terraformDir)) {
+            Files.createDirectories(terraformDir);
+            Path templateDir = Path.of("src/main/resources/terraform");
+            Files.walk(templateDir).forEach(source -> {
+                try {
+                    Path destination = terraformDir.resolve(templateDir.relativize(source));
+                    if (Files.isDirectory(source)) {
+                        Files.createDirectories(destination);
+                    } else {
+                        Files.copy(source, destination, StandardCopyOption.REPLACE_EXISTING);
+                    }
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+        }
+
+        Path tfvars = terraformDir.resolve("terraform.tfvars");
+
+        String accessKeyVal = creds != null ? creds.getAccessKeyId() : "";
+        String secretKeyVal = creds != null ? creds.getSecretAccessKey() : "";
+        String sessionTokenVal = creds != null ? creds.getSessionToken() : "";
+        String amiId = getUbuntuAmi(region);
+
+        String content =
+                "region=\"" + region + "\"\n" +
+                        "access_key=\"" + accessKeyVal + "\"\n" +
+                        "secret_key=\"" + secretKeyVal + "\"\n" +
+                        "session_token=\"" + sessionTokenVal + "\"\n" +
+                        "instance_type=\"t3.micro\"\n" +
+                        "app_port=" + appPort + "\n" +
+                        "deployment_id=\"" + deploymentId + "\"\n" +
+                        "ami_id=\"" + amiId + "\"";
+
+        Files.writeString(tfvars, content);
+
+        runWithRetry(terraformDir, "terraform", "init");
+        runWithRetry(terraformDir, "terraform", "destroy", "-auto-approve");
+
+        deleteDirectory(terraformDir);
+    }
+
     public void cleanupWorkspace(String deploymentId) {
         try {
             Path terraformDir = Path.of(TERRAFORM_ROOT, deploymentId);
@@ -210,5 +267,28 @@ public class TerraformService {
         }
 
         throw new RuntimeException("Failed to extract terraform output from:\n" + raw);
+    }
+
+    /**
+     * Ubuntu 22.04 LTS AMI IDs per AWS region (amd64, hvm:ebs-ssd).
+     * Updated: June 2026. For production, replace with dynamic EC2 DescribeImages lookup.
+     */
+    private static final Map<String, String> UBUNTU_AMIS = Map.ofEntries(
+            Map.entry("ap-south-1",    "ami-0f5ee92e2d63afc18"),
+            Map.entry("us-east-1",     "ami-0c7217cdde317cfec"),
+            Map.entry("us-east-2",     "ami-05fb0b8c1424f266b"),
+            Map.entry("us-west-1",     "ami-0ce2cb35386fc22e9"),
+            Map.entry("us-west-2",     "ami-008fe2fc65df48dac"),
+            Map.entry("eu-west-1",     "ami-0905a3c97561e0b69"),
+            Map.entry("eu-central-1",  "ami-0faab6bdbac9486fb"),
+            Map.entry("ap-southeast-1","ami-078c1149d8ad719a7")
+    );
+
+    private String getUbuntuAmi(String region) {
+        String ami = UBUNTU_AMIS.get(region);
+        if (ami != null) return ami;
+
+        System.err.println("⚠️ No cached AMI for region " + region + " — falling back to ap-south-1 AMI");
+        return UBUNTU_AMIS.get("ap-south-1");
     }
 }

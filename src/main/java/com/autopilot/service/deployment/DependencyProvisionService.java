@@ -3,11 +3,12 @@ package com.autopilot.service.deployment;
 import com.autopilot.dto.AwsCredentialsDto;
 import com.autopilot.intelligence.model.ConfigEntry;
 import com.autopilot.intelligence.model.ConfigIntelligenceResult;
-import com.autopilot.service.aws.AwsCredentialService;
 import com.autopilot.service.aws.RdsProvisioningService;
 import com.autopilot.service.aws.SecretsManagerService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
+
+import com.autopilot.service.deployment.runtime.dependency.*;
 
 import java.io.IOException;
 import java.net.Socket;
@@ -34,6 +35,7 @@ public class DependencyProvisionService {
 
     private final RdsProvisioningService rdsProvisioningService;
     private final SecretsManagerService secretsManagerService;
+    private final ServiceDependencyEngine serviceDependencyEngine;
 
     /**
      * Complete result of dependency provisioning.
@@ -44,6 +46,7 @@ public class DependencyProvisionService {
             String rdsEndpoint,
             String redisEndpoint,
             String secretsArn,
+            String rdsSecurityGroupId,
             List<String> provisionedServices,
             List<String> warnings,
             List<String> preDeployDbCommands
@@ -54,7 +57,7 @@ public class DependencyProvisionService {
      *
      * @param configResult  Config Intelligence results (databases, caches, env map)
      * @param deploymentId  Deployment ID
-     * @param roleArn       AWS IAM Role ARN
+     * @param creds         AWS Credentials DTO (resolved by CredentialResolverService)
      * @param region        AWS Region
      * @param workspace     Workspace path (for localhost replacement)
      * @param ec2InstanceId EC2 instance ID (for Redis-on-EC2 fallback)
@@ -64,7 +67,7 @@ public class DependencyProvisionService {
     public ProvisionResult provision(
             ConfigIntelligenceResult configResult,
             String deploymentId,
-            String roleArn,
+            AwsCredentialsDto creds,
             String region,
             Path workspace,
             String ec2InstanceId,
@@ -75,127 +78,57 @@ public class DependencyProvisionService {
         List<String> warnings = new ArrayList<>();
         String rdsEndpoint = null;
         String redisEndpoint = null;
+        String rdsSecurityGroupId = null;
 
         List<String> preDeployDbCommands = new ArrayList<>();
 
-        // ── STEP 1: Provision databases ──────────────────────────────────
-        for (String db : configResult.getDatabases()) {
-            boolean rdsSuccess = false;
-            try {
-                RdsProvisioningService.RdsResult rdsResult = rdsProvisioningService.provision(
-                        db, deploymentId, roleArn, region, progressLog);
-
-                if (rdsResult != null) {
-                    envVars.putAll(rdsResult.envVars());
-                    rdsEndpoint = rdsResult.endpoint() + ":" + rdsResult.port();
-                    provisioned.add("RDS:" + db.toUpperCase());
-                    progressLog.accept("✅ Provisioned RDS (" + db + ") → " + rdsResult.endpoint());
-                    rdsSuccess = true;
-                }
-            } catch (Exception e) {
-                warnings.add("RDS provisioning failed for " + db + ": " + e.getMessage());
-            }
-
-            // FALLBACK TO DOCKER ON EC2 IF RDS FAILS
-            if (!rdsSuccess) {
-                progressLog.accept("⚠️ RDS unavailable. Falling back to local Docker container on EC2 for " + db.toUpperCase());
-
-                String fallbackPassword = "AP" + UUID.randomUUID().toString().replace("-", "").substring(0, 10);
-                String fallbackDbName = "autopilotdb";
-                
-                if ("mysql".equalsIgnoreCase(db)) {
-                    String mysqlJdbcParams = "?allowPublicKeyRetrieval=true&useSSL=false&createDatabaseIfNotExist=true";
-                    preDeployDbCommands.addAll(List.of(
-                        "docker pull mysql:8",
-                        "docker rm -f autopilot-mysql 2>/dev/null || true",
-                        "docker run -d --name autopilot-mysql --network autopilot --restart unless-stopped " +
-                        "-e MYSQL_ROOT_PASSWORD=" + fallbackPassword + " -e MYSQL_DATABASE=" + fallbackDbName + " mysql:8",
-                        // Wait for MySQL to be ready before starting the app
-                        "for i in $(seq 1 30); do" +
-                        " if docker exec autopilot-mysql mysqladmin ping -h localhost --silent 2>/dev/null; then" +
-                        " echo 'MySQL ready (attempt '$i')'; break; fi;" +
-                        " echo 'Waiting for MySQL... ('$i'/30)'; sleep 2; done",
-                        "echo 'MySQL container started on autopilot-mysql:3306'"
-                    ));
-                    
-                    envVars.put("DATABASE_URL", "jdbc:mysql://autopilot-mysql:3306/" + fallbackDbName + mysqlJdbcParams);
-                    envVars.put("DB_HOST", "autopilot-mysql");
-                    envVars.put("DB_PORT", "3306");
-                    envVars.put("DB_NAME", fallbackDbName);
-                    envVars.put("DB_USER", "root");
-                    envVars.put("DB_PASSWORD", fallbackPassword);
-                    envVars.put("SPRING_DATASOURCE_URL", "jdbc:mysql://autopilot-mysql:3306/" + fallbackDbName + mysqlJdbcParams);
-                    envVars.put("SPRING_DATASOURCE_USERNAME", "root");
-                    envVars.put("SPRING_DATASOURCE_PASSWORD", fallbackPassword);
-                    
-                    provisioned.add("MYSQL:DOCKER_ON_EC2");
-                    rdsEndpoint = "autopilot-mysql:3306"; // Set for replacement logic downstream
-                    
-                } else if ("postgres".equalsIgnoreCase(db)) {
-                    preDeployDbCommands.addAll(List.of(
-                        "docker pull postgres:15",
-                        "docker rm -f autopilot-postgres 2>/dev/null || true",
-                        "docker run -d --name autopilot-postgres --network autopilot --restart unless-stopped " +
-                        "-e POSTGRES_PASSWORD=" + fallbackPassword + " -e POSTGRES_DB=" + fallbackDbName + " postgres:15",
-                        // Wait for Postgres to be ready before starting the app
-                        "for i in $(seq 1 30); do" +
-                        " if docker exec autopilot-postgres pg_isready -U postgres --silent 2>/dev/null; then" +
-                        " echo 'Postgres ready (attempt '$i')'; break; fi;" +
-                        " echo 'Waiting for Postgres... ('$i'/30)'; sleep 2; done",
-                        "echo 'Postgres container started on autopilot-postgres:5432'"
-                    ));
-                    
-                    envVars.put("DATABASE_URL", "jdbc:postgresql://autopilot-postgres:5432/" + fallbackDbName);
-                    envVars.put("DB_HOST", "autopilot-postgres");
-                    envVars.put("DB_PORT", "5432");
-                    envVars.put("DB_NAME", fallbackDbName);
-                    envVars.put("DB_USER", "postgres");
-                    envVars.put("DB_PASSWORD", fallbackPassword);
-                    envVars.put("SPRING_DATASOURCE_URL", "jdbc:postgresql://autopilot-postgres:5432/" + fallbackDbName);
-                    envVars.put("SPRING_DATASOURCE_USERNAME", "postgres");
-                    envVars.put("SPRING_DATASOURCE_PASSWORD", fallbackPassword);
-
-                    provisioned.add("POSTGRES:DOCKER_ON_EC2");
-                    rdsEndpoint = "autopilot-postgres:5432";
-                } else if ("mongodb".equalsIgnoreCase(db) || "mongo".equalsIgnoreCase(db)) {
-                    preDeployDbCommands.addAll(List.of(
-                        "docker pull mongo:6",
-                        "docker rm -f autopilot-mongo 2>/dev/null || true",
-                        "docker run -d --name autopilot-mongo --network autopilot --restart unless-stopped " +
-                        "-e MONGO_INITDB_ROOT_USERNAME=root -e MONGO_INITDB_ROOT_PASSWORD=" + fallbackPassword + " mongo:6",
-                        // Wait for Mongo to be ready before starting the app
-                        "for i in $(seq 1 30); do" +
-                        " if docker exec autopilot-mongo mongosh --quiet --eval 'db.adminCommand(\"ping\")' -u root -p " + fallbackPassword + " --authenticationDatabase admin 2>/dev/null; then" +
-                        " echo 'Mongo ready (attempt '$i')'; break; fi;" +
-                        " echo 'Waiting for Mongo... ('$i'/30)'; sleep 2; done",
-                        "echo 'Mongo container started on autopilot-mongo:27017'"
-                    ));
-                    
-                    String mongoUrl = "mongodb://root:" + fallbackPassword + "@autopilot-mongo:27017/" + fallbackDbName + "?authSource=admin";
-                    envVars.put("MONGO_URL", mongoUrl);
-                    envVars.put("MONGODB_URI", mongoUrl);
-                    envVars.put("SPRING_DATA_MONGODB_URI", mongoUrl);
-
-                    provisioned.add("MONGODB:DOCKER_ON_EC2");
-                    rdsEndpoint = "autopilot-mongo:27017";
+        // ── STEP 1 & 2: Provision & negotiate databases & caches via V4.4 Engine ──
+        try {
+            RuntimeDependencyContract dependencyContract = serviceDependencyEngine.orchestrate(
+                    configResult.getDatabases(),
+                    configResult.getCaches(),
+                    configResult.getEnvMap(),
+                    (creds != null) ? "MANAGED" : "BYOC",
+                    deploymentId,
+                    creds,
+                    region,
+                    ec2InstanceId,
+                    progressLog
+            );
+            
+            envVars.putAll(dependencyContract.getNegotiatedEnvVars());
+            preDeployDbCommands.addAll(dependencyContract.getPreDeployCommands());
+            
+            for (DependencyDescriptor desc : dependencyContract.getDependencies()) {
+                provisioned.add(desc.getProvider() + ":" + desc.getType().toUpperCase());
+                if (desc.getConnectionUri() != null) {
+                    String cleanUri = desc.getConnectionUri();
+                    if (cleanUri.startsWith("jdbc:")) {
+                        cleanUri = cleanUri.substring(5);
+                    }
+                    try {
+                        java.net.URI u = new java.net.URI(cleanUri);
+                        if ("redis".equalsIgnoreCase(desc.getType())) {
+                            redisEndpoint = u.getHost() + ":" + (u.getPort() != -1 ? u.getPort() : 6379);
+                        } else {
+                            rdsEndpoint = u.getHost() + ":" + (u.getPort() != -1 ? u.getPort() : 3306);
+                        }
+                    } catch (Exception ignored) {
+                        if ("redis".equalsIgnoreCase(desc.getType())) {
+                            redisEndpoint = "autopilot-redis:6379";
+                        } else {
+                            rdsEndpoint = "autopilot-" + desc.getType().toLowerCase() + (desc.getType().equalsIgnoreCase("mysql") ? ":3306" : ":5432");
+                        }
+                    }
                 }
             }
-        }
-
-        // ── STEP 2: Provision caches (Redis on EC2) ──────────────────────
-        for (String cache : configResult.getCaches()) {
-            if ("redis".equalsIgnoreCase(cache)) {
-                // Redis will be deployed as Docker container on EC2 alongside the app
-                redisEndpoint = "autopilot-redis:6379";
-                envVars.put("REDIS_URL", "redis://autopilot-redis:6379");
-                envVars.put("REDIS_HOST", "autopilot-redis");
-                envVars.put("REDIS_PORT", "6379");
-                envVars.put("SPRING_DATA_REDIS_HOST", "autopilot-redis");
-                envVars.put("SPRING_DATA_REDIS_PORT", "6379");
-                envVars.put("CACHE_URL", "redis://autopilot-redis:6379");
-                provisioned.add("REDIS:DOCKER_ON_EC2");
-                progressLog.accept("✅ Redis will be deployed as Docker container on EC2");
-            }
+        } catch (CredentialValidationException e) {
+            DependencyReports.CredentialValidationReport rep = e.getReport();
+            progressLog.accept("❌ Database Credential Validation Failed: " + rep.getFailureType());
+            progressLog.accept("❌ Step: " + rep.getValidationStep());
+            progressLog.accept("❌ Cause: " + rep.getRootCause());
+            progressLog.accept("❌ Fix: " + rep.getSuggestedFix());
+            throw new RuntimeException("DATABASE_VALIDATION_FAILED: " + rep.getFailureType() + " - " + rep.getRootCause());
         }
 
         // ── STEP 3: Replace localhost references in config files ─────────
@@ -246,7 +179,7 @@ public class DependencyProvisionService {
         if (!secretEntries.isEmpty()) {
             try {
                 secretsArn = secretsManagerService.storeSecrets(
-                        deploymentId, secretEntries, roleArn, region);
+                        deploymentId, secretEntries, creds, region);
             } catch (Exception e) {
                 warnings.add("Secrets Manager storage failed: " + e.getMessage());
             }
@@ -257,7 +190,7 @@ public class DependencyProvisionService {
 
         return new ProvisionResult(
                 envVars, dockerEnvFlags, rdsEndpoint, redisEndpoint,
-                secretsArn, provisioned, warnings, preDeployDbCommands
+                secretsArn, rdsSecurityGroupId, provisioned, warnings, preDeployDbCommands
         );
     }
 
@@ -344,44 +277,68 @@ public class DependencyProvisionService {
                 String content = Files.readString(file);
                 String original = content;
 
-                // Replace database localhost references
-                if (rdsEndpoint != null) {
-                    String rdsHost = rdsEndpoint.contains(":") ? rdsEndpoint.split(":")[0] : rdsEndpoint;
+                    // Replace database localhost references
+                    // MySQL / MariaDB
+                    java.util.regex.Pattern mysqlPattern = java.util.regex.Pattern.compile(
+                            "jdbc:mysql://(localhost|127\\.0\\.0\\.1)(:\\d+)?(/([a-zA-Z0-9_\\-\\.]+))?(\\?[^\\s\"'\\n]*)?"
+                    );
+                    java.util.regex.Matcher mysqlMatcher = mysqlPattern.matcher(content);
+                    StringBuilder mysqlSb = new StringBuilder();
+                    while (mysqlMatcher.find()) {
+                        String dbName = mysqlMatcher.group(4);
+                        String queryParams = mysqlMatcher.group(5);
+                        String replacement = "jdbc:mysql://" + rdsEndpoint + 
+                                "/" + (dbName != null ? dbName : "autopilotdb") + 
+                                (queryParams != null ? queryParams : "");
+                        mysqlMatcher.appendReplacement(mysqlSb, java.util.regex.Matcher.quoteReplacement(replacement));
+                    }
+                    mysqlMatcher.appendTail(mysqlSb);
+                    content = mysqlSb.toString();
 
+                    // PostgreSQL
+                    java.util.regex.Pattern pgPattern = java.util.regex.Pattern.compile(
+                            "jdbc:postgresql://(localhost|127\\.0\\.0\\.1)(:\\d+)?(/([a-zA-Z0-9_\\-\\.]+))?(\\?[^\\s\"'\\n]*)?"
+                    );
+                    java.util.regex.Matcher pgMatcher = pgPattern.matcher(content);
+                    StringBuilder pgSb = new StringBuilder();
+                    while (pgMatcher.find()) {
+                        String dbName = pgMatcher.group(4);
+                        String queryParams = pgMatcher.group(5);
+                        String replacement = "jdbc:postgresql://" + rdsEndpoint + 
+                                "/" + (dbName != null ? dbName : "autopilotdb") + 
+                                (queryParams != null ? queryParams : "");
+                        pgMatcher.appendReplacement(pgSb, java.util.regex.Matcher.quoteReplacement(replacement));
+                    }
+                    pgMatcher.appendTail(pgSb);
+                    content = pgSb.toString();
+
+                    // MongoDB URLs
+                    java.util.regex.Pattern mongoPattern = java.util.regex.Pattern.compile(
+                            "mongodb://(localhost|127\\.0\\.0\\.1)(:\\d+)?(/([a-zA-Z0-9_\\-\\.]+))?(\\?[^\\s\"'\\n]*)?"
+                    );
+                    java.util.regex.Matcher mongoMatcher = mongoPattern.matcher(content);
+                    StringBuilder mongoSb = new StringBuilder();
+                    while (mongoMatcher.find()) {
+                        String dbName = mongoMatcher.group(4);
+                        String queryParams = mongoMatcher.group(5);
+                        String replacement;
+                        if (envVars.containsKey("MONGODB_URI")) {
+                            replacement = envVars.get("MONGODB_URI");
+                        } else {
+                            replacement = "mongodb://" + rdsEndpoint + 
+                                    "/" + (dbName != null ? dbName : "autopilotdb") + 
+                                    (queryParams != null ? queryParams : "?authSource=admin");
+                        }
+                        mongoMatcher.appendReplacement(mongoSb, java.util.regex.Matcher.quoteReplacement(replacement));
+                    }
+                    mongoMatcher.appendTail(mongoSb);
+                    content = mongoSb.toString();
+
+                    // Literal string replacements (safe fallbacks for other config properties)
                     content = content.replace("localhost:3306", rdsEndpoint);
                     content = content.replace("127.0.0.1:3306", rdsEndpoint);
                     content = content.replace("localhost:5432", rdsEndpoint);
                     content = content.replace("127.0.0.1:5432", rdsEndpoint);
-
-                    // JDBC URLs - we capture the full path and replace it so it uses the guaranteed created 'autopilotdb' schema
-                    content = content.replaceAll(
-                            "jdbc:mysql://localhost(:\\d+)?(/[a-zA-Z0-9_\\-\\.]+)?",
-                            "jdbc:mysql://" + rdsEndpoint + "/autopilotdb"
-                    );
-                    content = content.replaceAll(
-                            "jdbc:mysql://127\\.0\\.0\\.1(:\\d+)?(/[a-zA-Z0-9_\\-\\.]+)?",
-                            "jdbc:mysql://" + rdsEndpoint + "/autopilotdb"
-                    );
-                    content = content.replaceAll(
-                            "jdbc:postgresql://localhost(:\\d+)?(/[a-zA-Z0-9_\\-\\.]+)?",
-                            "jdbc:postgresql://" + rdsEndpoint + "/autopilotdb"
-                    );
-                    content = content.replaceAll(
-                            "jdbc:postgresql://127\\.0\\.0\\.1(:\\d+)?(/[a-zA-Z0-9_\\-\\.]+)?",
-                            "jdbc:postgresql://" + rdsEndpoint + "/autopilotdb"
-                    );
-
-                    // MongoDB URLs
-                    String finalMongoReplacement = envVars.containsKey("MONGODB_URI") ? envVars.get("MONGODB_URI") : "mongodb://" + rdsEndpoint + "/autopilotdb?authSource=admin";
-                    content = content.replaceAll(
-                            "mongodb://localhost(:\\d+)?(/[a-zA-Z0-9_\\-\\.]+)?",
-                            finalMongoReplacement
-                    );
-                    content = content.replaceAll(
-                            "mongodb://127\\.0\\.0\\.1(:\\d+)?(/[a-zA-Z0-9_\\-\\.]+)?",
-                            finalMongoReplacement
-                    );
-                }
 
                 if (!content.equals(original)) {
                     Files.writeString(file, content);
@@ -493,26 +450,59 @@ public class DependencyProvisionService {
      * the deployed app is accessible from the dynamic EC2 IP.
      */
     private int neutralizeCorsSettings(Path workspace) throws IOException {
-        int count = 0;
+        java.util.concurrent.atomic.AtomicInteger count = new java.util.concurrent.atomic.AtomicInteger(0);
+
         Files.walk(workspace)
                 .filter(Files::isRegularFile)
-                .filter(p -> p.getFileName().toString().endsWith(".java"))
                 .filter(p -> !p.toString().contains("node_modules"))
+                .filter(p -> !p.toString().contains(".git/"))
                 .forEach(file -> {
                     try {
+                        String name = file.getFileName().toString();
                         String content = Files.readString(file);
-                        if (content.contains("setAllowedOrigins") && (content.contains("localhost") || content.contains("127.0.0.1"))) {
-                            // Replace list of origins with a wildcard
-                            String pattern = "setAllowedOrigins\\s*\\(\\s*List\\.of\\([^\\)]+\\)\\s*\\)";
-                            String replaced = content.replaceAll(pattern, "setAllowedOrigins(List.of(\"*\"))");
-                            
-                            if (!replaced.equals(content)) {
-                                Files.writeString(file, replaced);
+                        String original = content;
+
+                        if (name.endsWith(".java")) {
+                            // Fix setAllowedOrigins(List.of("localhost"...))
+                            if (content.contains("setAllowedOrigins") && (content.contains("localhost") || content.contains("127.0.0.1"))) {
+                                content = content.replaceAll(
+                                        "setAllowedOrigins\\s*\\(\\s*List\\.of\\([^)]+\\)\\s*\\)",
+                                        "setAllowedOrigins(List.of(\"*\"))");
+                                content = content.replaceAll(
+                                        "setAllowedOrigins\\s*\\(\\s*Arrays\\.asList\\([^)]+\\)\\s*\\)",
+                                        "setAllowedOrigins(Arrays.asList(\"*\"))");
                             }
+                            // Fix @CrossOrigin(origins = "http://localhost:3000")
+                            content = content.replaceAll(
+                                    "@CrossOrigin\\s*\\(\\s*origins\\s*=\\s*\"[^\"]*localhost[^\"]*\"\\s*\\)",
+                                    "@CrossOrigin(origins = \"*\")");
+                            // Fix @CrossOrigin(origins = {"http://...", "http://..."})
+                            content = content.replaceAll(
+                                    "@CrossOrigin\\s*\\(\\s*origins\\s*=\\s*\\{[^}]*localhost[^}]*\\}\\s*\\)",
+                                    "@CrossOrigin(origins = \"*\")");
+                        }
+
+                        if (name.endsWith(".properties")) {
+                            // Fix allowed-origins=http://localhost:3000
+                            content = content.replaceAll(
+                                    "(allowed-origins\\s*=).*localhost.*",
+                                    "$1*");
+                        }
+
+                        if (name.endsWith(".yml") || name.endsWith(".yaml")) {
+                            // Fix allowed-origins: http://localhost:3000
+                            content = content.replaceAll(
+                                    "(allowed-origins:\\s*).*localhost.*",
+                                    "$1\"*\"");
+                        }
+
+                        if (!content.equals(original)) {
+                            Files.writeString(file, content);
+                            count.incrementAndGet();
                         }
                     } catch (Exception ignored) {}
                 });
-        
-        return 1; 
+
+        return count.get();
     }
 }

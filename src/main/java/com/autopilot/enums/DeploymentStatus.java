@@ -26,5 +26,9 @@ public enum DeploymentStatus {
 
     SUCCESS,
 
-    FAILED
+    FAILED,
+
+    DESTROYING,
+
+    DESTROYED
 }

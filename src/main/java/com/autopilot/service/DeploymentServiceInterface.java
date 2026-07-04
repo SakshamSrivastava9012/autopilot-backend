@@ -13,4 +13,6 @@ public interface DeploymentServiceInterface {
     Deployment getDeployment(String id, User user);
 
     List<Deployment> getUserDeployments(User user);
+
+    Deployment deleteDeployment(String id, User user);
 }

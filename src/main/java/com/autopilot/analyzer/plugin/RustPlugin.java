@@ -3,39 +3,52 @@ package com.autopilot.analyzer.plugin;
 import com.autopilot.analyzer.detectors.FrameworkPlugin;
 import com.autopilot.analyzer.model.ServiceConfig;
 
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 
 public class RustPlugin implements FrameworkPlugin {
 
     @Override
-    public ServiceConfig detect(List<String> files) {
+    public List<ServiceConfig> detect(List<String> files) {
+        List<ServiceConfig> services = new ArrayList<>();
 
         for (String file : files) {
-            if (file.endsWith("Cargo.toml")) {
-
+            if (file.endsWith("Cargo.toml") && !file.contains("node_modules")) {
                 ServiceConfig service = new ServiceConfig();
-
                 service.setFramework("rust");
                 service.setLanguage("rust");
                 service.setStrategyUsed("TEMPLATE");
                 service.setRuntimeVersion("1.77");
                 service.setConfidence(85);
-                service.setName("rust-service");
+                
+                String name = deriveServiceName(file, "rust-service");
+                service.setName(name);
 
-                String path = file.replace("/Cargo.toml", "").replace("Cargo.toml", ".");
-                service.setPath(path);
+                Path parent = Path.of(file).getParent();
+                String pathStr = parent == null ? "." : parent.toString();
+                service.setPath(pathStr);
 
                 service.setBuildCommand("cargo build --release");
                 service.setStartCommand("./target/release/*");
                 service.setPort(8080);
 
                 service.setDockerfileExists(
-                        files.contains(path + "/Dockerfile") || files.contains("Dockerfile")
+                        files.contains(pathStr + "/Dockerfile") || files.contains("Dockerfile")
                 );
 
-                return service;
+                services.add(service);
             }
         }
-        return null;
+        return services;
+    }
+
+    private String deriveServiceName(String file, String defaultName) {
+        Path parent = Path.of(file).getParent();
+        if (parent == null || parent.getFileName() == null) {
+            return defaultName;
+        }
+        return parent.getFileName().toString();
     }
 }
+

@@ -36,6 +36,14 @@ public class DeploymentController {
     }
 
     /**
+     * Delete/Destroy a deployment.
+     */
+    @DeleteMapping("/{id}")
+    public Deployment deleteDeployment(@PathVariable String id, Authentication auth) {
+        return deploymentService.deleteDeployment(id, extractUser(auth));
+    }
+
+    /**
      * List all deployments belonging to the authenticated user.
      */
     @GetMapping

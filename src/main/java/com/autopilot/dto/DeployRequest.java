@@ -10,6 +10,10 @@ public class DeployRequest {
     private String branch;
     private String projectName;
 
+    // MANAGED (deploy on Autopilot's AWS) | BYOC (user provides their own AWS ARN)
+    // Defaults to BYOC for backward compatibility
+    private String deploymentMode;
+
     private String buildCommand;
     private String startCommand;
 
@@ -19,10 +23,12 @@ public class DeployRequest {
     // traffic estimate
     private Integer expectedUsers;   // e.g. 100, 1000, 10000
 
-    // AWS config
+    // AWS config (required for BYOC, ignored for MANAGED)
     private String awsRoleArn;
     private String awsRegion;
 
     // Custom environment variables
     private Map<String, String> envVars;
+
+    private String instanceTypeOverride;
 }

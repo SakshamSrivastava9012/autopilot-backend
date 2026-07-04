@@ -17,31 +17,43 @@ import java.util.Base64;
 @RequiredArgsConstructor
 public class DockerPushService {
 
-    private final AwsCredentialService awsCredentialService;
+    private final RegistryUploadEngine registryUploadEngine;
 
     public String pushImage(
-            String roleArn,
+            AwsCredentialsDto creds,
             String region,
             String imageName
     ) throws Exception {
+        return pushImage(creds, region, imageName, System.out::println);
+    }
 
-        // 1️⃣ Assume role
-        AwsCredentialsDto creds =
-                awsCredentialService.assumeRole(roleArn);
+    public String pushImage(
+            AwsCredentialsDto creds,
+            String region,
+            String imageName,
+            java.util.function.Consumer<String> progressLog
+    ) throws Exception {
 
-        AwsSessionCredentials sessionCredentials =
-                AwsSessionCredentials.create(
-                        creds.getAccessKeyId(),
-                        creds.getSecretAccessKey(),
-                        creds.getSessionToken()
-                );
+        EcrClient ecrClient;
+        if (creds == null) {
+            ecrClient = EcrClient.builder()
+                    .region(Region.of(region))
+                    .build();
+        } else {
+            AwsSessionCredentials sessionCredentials =
+                    AwsSessionCredentials.create(
+                             creds.getAccessKeyId(),
+                             creds.getSecretAccessKey(),
+                             creds.getSessionToken()
+                    );
 
-        EcrClient ecrClient = EcrClient.builder()
-                .region(Region.of(region))
-                .credentialsProvider(
-                        StaticCredentialsProvider.create(sessionCredentials)
-                )
-                .build();
+            ecrClient = EcrClient.builder()
+                    .region(Region.of(region))
+                    .credentialsProvider(
+                            StaticCredentialsProvider.create(sessionCredentials)
+                    )
+                    .build();
+        }
 
         String repoUri;
 
@@ -109,36 +121,38 @@ public class DockerPushService {
                 fullImage
         });
 
-        // 5️⃣ Push image
-        runCommand(new String[]{
-                "docker",
-                "push",
-                fullImage
-        });
+        // 5️⃣ Push image via RegistryUploadEngine
+        RegistryUploadReport report = registryUploadEngine.uploadImage(ecrClient, imageName, fullImage, progressLog);
+        if (!report.isSuccess()) {
+            throw new RuntimeException("Docker push failed via RegistryUploadEngine: " + report.getErrorMessage());
+        }
 
         return fullImage;
     }
 
     private void runCommand(String[] command) throws Exception {
 
-        Process process =
-                Runtime.getRuntime().exec(command);
+        ProcessBuilder pb = new ProcessBuilder(command);
+        pb.redirectErrorStream(true); // merge stderr into stdout
+        Process process = pb.start();
 
+        StringBuilder output = new StringBuilder();
         BufferedReader reader =
                 new BufferedReader(
                         new InputStreamReader(process.getInputStream())
                 );
 
         String line;
-
         while ((line = reader.readLine()) != null) {
             System.out.println(line);
+            output.append(line).append("\n");
         }
 
         int exit = process.waitFor();
 
         if (exit != 0) {
-            throw new RuntimeException("Docker command failed");
+            throw new RuntimeException("Docker command failed (exit " + exit + "): "
+                    + output.toString().trim());
         }
     }
 }

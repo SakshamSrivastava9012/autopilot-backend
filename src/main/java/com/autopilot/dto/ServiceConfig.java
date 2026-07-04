@@ -16,4 +16,5 @@ public class ServiceConfig {
     private String startCommand;
 
     private Integer port;
+    private String role;
 }

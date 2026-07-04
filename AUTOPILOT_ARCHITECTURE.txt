@@ -1,0 +1,242 @@
+================================================================================
+                     AUTOPILOT PLATFORM: SYSTEM ARCHITECTURE
+================================================================================
+
+This document provides the complete, end-to-end technical specification,
+operational architecture, and structural layout of the Autopilot Platform.
+Autopilot is an automated, self-healing, multi-tenant container orchestration
+and deployment system designed to provision full-stack applications dynamically on AWS.
+
+--------------------------------------------------------------------------------
+1. COMPONENT TOPOLOGY
+--------------------------------------------------------------------------------
+
+The system is composed of two primary sub-systems cooperating over HTTP APIs and
+asynchronous message queues:
+
+  +-------------------------------------------------------------------------+
+  |                          User Browser / Client                          |
+  +-------------------------------------------------------------------------+
+                                       |
+                   HTTP REST APIs / Server-Sent Events (SSE)
+                                       |
+                                       v
+  +-------------------------------------------------------------------------+
+  |                        Spring Boot Backend Server                       |
+  |                        [Port: 8080 | Context: /]                       |
+  +-------------------------------------------------------------------------+
+     |                    |                                |
+     | (MySQL Read/Write) | (Async Job Enqueue/Dequeue)    | (Local execution)
+     v                    v                                v
+  [(MySQL Database)]   [(Redis Queue)]              [Terraform CLI Tool]
+                          ^                                |
+                          | (Worker Thread Polls)          | (Provisions VPC/EC2)
+                          v                                v
+                     [DeploymentWorkerPool]         [AWS Cloud Resources]
+                          |
+                          v
+               [DeploymentPipelineService]
+                          |
+             (AWS STS / ECR / SSM Client Calls)
+                          |
+                          v
+            +-------------------------------------------+
+            |          AWS Target Infrastructure        |
+            |                                           |
+            |  +-------------------------------------+  |
+            |  |             EC2 Instance            |  |
+            |  +-------------------------------------+  |
+            |  | * Docker Daemon                     |  |
+            |  | * Nginx Outer Reverse Proxy         |  |
+            |  | * App Container A (Frontend)        |  |
+            |  | * App Container B (Backend API)     |  |
+            |  +-------------------------------------+  |
+            |                                           |
+            |  * AWS RDS MySQL / PostgreSQL Database    |
+            |  * AWS Secrets Manager (Secure Storage)   |
+            +-------------------------------------------+
+
+--------------------------------------------------------------------------------
+2. DATA & CONTROL PIPELINES (THE PIPELINE SEQUENCE)
+--------------------------------------------------------------------------------
+
+A single deployment lifecycle transitions through the following precise stages:
+
+[STAGE 1: INGESTION & ENQUEUEING]
+* The User requests deployment via POST `/api/deployments` submitting repository details,
+  AWS credentials mode, target environment parameters, and ports.
+* The DeploymentController validates the token/session and user credentials.
+* The record is saved in MySQL with a status of PENDING.
+* The deployment ID is enqueued into the Redis-backed queue.
+* The client immediately receives a 200 OK containing the pending Deployment entity,
+  then opens an SSE connection to `/api/deployments/{id}/logs` to stream logs.
+
+[STAGE 2: WORKER DEQUEUING & INITIALIZATION]
+* A thread in DeploymentWorkerPool retrieves the deployment ID.
+* The worker invokes CredentialResolverService to obtain credentials for AWS calls.
+* The worker performs a git clone of the target repository to a temporary workspace.
+
+[STAGE 3: REPOSITORY INSPECTION & CLASSIFICATION]
+* ConfigIntelligencePipeline triggers the Repository Discovery phase.
+* It scans directory trees for configuration files (pom.xml, package.json, requirements.txt, etc.).
+* FrameworkRegistry classifies each discovered service (e.g. spring_boot, react_vite, angular, express).
+* Roles are dynamically mapped:
+  - Frontend frameworks (React, Angular, Static HTML) -> "frontend" role.
+  - Backend/API frameworks (Spring Boot, Express, Django) -> "api" or "backend" role.
+* Path allocations are determined:
+  - The frontend is assigned a path prefix (e.g., `/app-xxxx`).
+  - The API/Backend is assigned an API path prefix (e.g., `/app-xxxx-api`).
+
+[STAGE 4: IMMUTABLE PLANNING]
+* The deployment details are resolved into an ordered list of immutable DeploymentService objects.
+* Database connections are analyzed: if a database dependency (e.g. MySQL) is detected,
+  RDS provisioning is scheduled, and credentials are built.
+
+[STAGE 5: PROVISIONING & INFRASTRUCTURE AUTOMATION]
+* TerraformService spins up a workspace directory at `/tmp/autopilot-terraform/{deploymentId}`.
+* It writes standard Terraform files and variables (`terraform.tfvars`) specifying custom VPCs,
+  EC2 instances, security groups, and ingress rules.
+* Terraform runs `terraform init` and `terraform apply` with a 3-attempt retry engine.
+* AWS RDS provisions the database instance (if required).
+* Connection credentials are saved in AWS Secrets Manager and exposed via an ECR-compatible format.
+
+[STAGE 6: BUILD, CONTAINERIZE & REGISTRY PUSH]
+* DockerBuilder dynamically constructs Dockerfiles for each classified service
+  (unless a custom Dockerfile already exists).
+* Docker compiles the container image and ECRPushService pushes it to AWS Elastic Container Registry (ECR).
+* If a compilation error occurs, the Self-Healing Build Engine analyzes the logs:
+  - Permission Error -> adds `chmod +x` to gradlew/mvnw wrappers.
+  - Version Mismatch -> dynamically updates the target JDK/Node build version.
+  - Dependency Mismatch -> appends options like `--legacy-peer-deps`.
+  - Missing File -> triggers the generic fallback multi-stage Dockerfile.
+
+[STAGE 7: REMOTE HOST DEPLOYMENT (SSM)]
+* SSMDeployService connects to the target EC2 host via AWS Systems Manager (SSM).
+* It pulls the docker images from AWS ECR.
+* It runs the containers on the EC2 host within a shared docker network named `autopilot`.
+* It assigns container-side listener ports and maps them to host-side dynamic ports.
+
+[STAGE 8: NGINGX OUTER ROUTING CONFIGURATION]
+* UniversalNginxGenerator generates a single, clean Nginx config for the EC2 host.
+* It mounts strict namespace-based routes matching the designated prefixes:
+  - `location /app-xxxx/` proxy passes to the frontend container.
+  - `location /app-xxxx-api/` proxy passes to the backend/API container.
+* It uploads this configuration to the host's Nginx service via SSM and restarts Nginx.
+
+[STAGE 9: CONTAINER-LEVEL PATH NORMALIZATION (SPA REWRITING)]
+* Inside static React/Vite SPA containers, Nginx needs to serve assets relatively.
+* StaticSiteRuntimeStrategy injects a dynamic container-level rewrite rule:
+  `rewrite ^/app-xxxx(/?.*)$ $1 last;`
+  This strips the outer base-path routing prefix before Nginx matches static assets locally,
+  preventing 404s for frontend resources.
+
+[STAGE 10: HEALTH NEGOTIATION & VALIDATION]
+* The startup StatefulWaitEngine polls the deployed application endpoint on the EC2 host.
+* Post-deployment, CapabilityHealthVerifier performs a final HTTP request validation.
+* To support microservices that lack explicit root health pages or default to redirects,
+  both engines accept 200, 201, 202, 204, 301, 302, 307, 308, 401, 403, 404, and 405 response codes.
+  An active server response of any kind verifies that the service is running and accessible.
+* The deployment status is updated in MySQL to RUNNING.
+
+--------------------------------------------------------------------------------
+3. AWS CREDENTIAL ROUTING ARCHITECTURE
+--------------------------------------------------------------------------------
+
+Autopilot ensures security isolation via dynamic credential mapping:
+
+                    [Deployment Request]
+                             |
+                             v
+               [CredentialResolverService]
+                             |
+         +-------------------+-------------------+
+         |                                       |
+   [MANAGED Mode]                         [BYOC Mode]
+         |                                       |
+   No AWS Role Arn                       Has Custom Role Arn
+         |                                       |
+   Use local instance                    Assume Role via AWS STS
+   credentials directly                 (Duration: 3600 seconds)
+         |                                       |
+         +-------------------+-------------------+
+                             |
+                             v
+                 [AwsCredentialsDto Resolved]
+                             |
+        +--------------------+--------------------+
+        |                    |                    |
+        v                    v                    v
+  [RDS Client]         [Secrets Manager]      [SSM Client]
+
+This architecture ensures that downstream clients never access hardcoded system
+environment variables, preventing cross-tenant access.
+
+--------------------------------------------------------------------------------
+4. CRITICAL DIRECTORY & CODE FILE LINKS
+--------------------------------------------------------------------------------
+
+The following list links the core components of the system to their locations:
+
+[BACKEND WORKSPACE ROOT: /home/saksham/autopilot-backend]
+  |
+  +-- /src/main/java/com/autopilot
+        |
+        +-- controller/
+        |     * DeploymentController.java : Entry endpoint handling /deploy and /logs.
+        |     * AuthController.java : Manages user authentication and tokens.
+        |
+        +-- entity/ & repository/
+        |     * User.java / UserRepository.java : User credentials and tenancy.
+        |     * Deployment.java / DeploymentRepository.java : Deployment states and logs.
+        |
+        +-- queue/ & worker/
+        |     * RedisQueueService.java : Enqueues and dequeues deployment task IDs.
+        |     * DeploymentWorker.java : Daemon workers executing tasks.
+        |
+        +-- service/
+        |     |
+        |     +-- aws/
+        |     |     * CredentialResolverService.java : Resolves STS credentials (MANAGED/BYOC).
+        |     |     * DockerPushService.java : Pushes compiled docker images to AWS ECR.
+        |     |     * SecretsManagerService.java : Stores DB secrets and configurations.
+        |     |
+        |     +-- deployment/
+        |     |     * DeploymentPipelineService.java : Core orchestrator running the 10 stages.
+        |     |     * DockerBuilder.java : Self-healing Dockerfile builder and compiler.
+        |     |     * strategies/RuntimeStrategies.java : Defines Dockerfile and run options.
+        |     |       - Contains StaticSiteRuntimeStrategy injects Nginx rewrite rule.
+        |     |     * validation/CapabilityHealthVerifier.java : Post-deploy HTTP checker.
+        |     |
+        |     +-- infrastructure/
+        |     |     * UniversalNginxGenerator.java : Generates target Nginx route configs.
+        |     |     * ec2/StatefulWaitEngine.java : Startup verification polling.
+        |     |
+        |     +-- terraform/
+        |           * TerraformService.java : Configures and applies EC2/VPC environments.
+        |
+        +-- intelligence/
+              * ConfigIntelligencePipeline.java : Static scanners and framework detectors.
+
+[FRONTEND WORKSPACE ROOT: /home/saksham/autopilot-backend/Autopilot-frontend]
+  |
+  +-- /src
+        |
+        +-- components/
+        |     * Navbar.jsx : Navigation bar header.
+        |
+        +-- hooks/
+        |     * useAuth.jsx : Context provider managing JWT tokens and authentication.
+        |
+        +-- pages/
+        |     * Landing.jsx : Interactive splash introduction.
+        |     * Login.jsx / Register.jsx : Authenticating identities.
+        |     * Dashboard.jsx : Interactive grid containing deployment listings and state logs.
+        |     * NewDeploy.jsx : Ingestion form collecting repository URL and AWS role params.
+        |     * DeployDetail.jsx : Live-streaming SSE console logger displaying output details.
+        |
+        +-- config/
+              * api.js : Mappings for backend server endpoints.
+
+================================================================================
+                                 END OF FILE
+================================================================================
